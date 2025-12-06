@@ -1,14 +1,19 @@
 #!/usr/bin/env python
+import numpy as np
 import pygame
 from pygame import Rect, Surface
 import random
 import os
-import kezmenu
+import MaTris.kezmenu.kezmenu as kezmenu
 
-from tetrominoes import list_of_tetrominoes
-from tetrominoes import rotate
+from MaTris.tetrominoes import list_of_tetrominoes
+from MaTris.tetrominoes import rotate
 
-from scores import load_score, write_score
+from MaTris.scores import load_score, write_score
+from enum import Enum
+
+from MaTris.tetrominoes import tetrominoes_index
+
 
 class GameOver(Exception):
     """Exception used for its control flow properties"""
@@ -36,22 +41,66 @@ TRICKY_CENTERX = WIDTH-(WIDTH-(MATRIS_OFFSET+BLOCKSIZE*MATRIX_WIDTH+BORDERWIDTH*
 
 VISIBLE_MATRIX_HEIGHT = MATRIX_HEIGHT - 2
 
+class Action(Enum):
+    RIGHT = 0
+    LEFT = 1
+    DOWN = 2
+    ROTATE = 3
+    HARD_DROP = 4
+    # NONE = 5
+
+class Piece:
+    def __init__(self, shape, color, position = None):
+        self.shape = shape
+        self.color = color
+        self.position = position if position is not None else ((0,4) if len(shape) == 2 else (0, 3))
+
+class Grid:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.grid = np.zeros((height, width), dtype=np.uint8)
+
+    def fits_in_matrix(self, piece: Piece) -> bool:
+        """
+        Checks if tetromino fits on the board
+        """
+        posY, posX = piece.position
+        for x in range(posX, posX + len(piece.shape)):
+            for y in range(posY, posY + len(piece.shape)):
+                if self.grid[y][x] is False and piece.shape[y - posY][x - posX]:  # outside matrix
+                    return False
+
+        return True
+
+
+
 
 class Matris(object):
-    def __init__(self):
-        self.surface = screen.subsurface(Rect((MATRIS_OFFSET+BORDERWIDTH, MATRIS_OFFSET+BORDERWIDTH),
-                                              (MATRIX_WIDTH * BLOCKSIZE, (MATRIX_HEIGHT-2) * BLOCKSIZE)))
+    def __init__(self, hard_drop_scores = False, actions_until_drop = 10):
+        self.surface = None
 
         self.matrix = dict()
         for y in range(MATRIX_HEIGHT):
             for x in range(MATRIX_WIDTH):
                 self.matrix[(y,x)] = None
+
+        self.heights = dict()
+        for x in range(MATRIX_WIDTH):
+            self.heights[x] = 0
+
+        self.empty_matrix = dict()
+        for y in range(MATRIX_HEIGHT):
+            for x in range(MATRIX_WIDTH):
+                self.empty_matrix[(y, x)] = None
         """
         `self.matrix` is the current state of the tetris board, that is, it records which squares are
         currently occupied. It does not include the falling tetromino. The information relating to the
         falling tetromino is managed by `self.set_tetrominoes` instead. When the falling tetromino "dies",
         it will be placed in `self.matrix`.
         """
+
+        self.hard_drop_scores = hard_drop_scores
 
         self.next_tetromino = random.choice(list_of_tetrominoes)
         self.set_tetrominoes()
@@ -71,21 +120,37 @@ class Matris(object):
         
         self.paused = False
 
-        self.highscore = load_score()
-        self.played_highscorebeaten_sound = False
+        self.actions_until_drop = actions_until_drop
+        self.actions_left = self.actions_until_drop
 
-        self.levelup_sound  = get_sound("levelup.wav")
-        self.gameover_sound = get_sound("gameover.wav")
-        self.linescleared_sound = get_sound("linecleared.wav")
-        self.highscorebeaten_sound = get_sound("highscorebeaten.wav")
+    def reset(self):
+        self.matrix = dict()
+        for y in range(MATRIX_HEIGHT):
+            for x in range(MATRIX_WIDTH):
+                self.matrix[(y,x)] = None
 
+        self.next_tetromino = self.select_next()
+        self.set_tetrominoes()
+
+        self.level = 1
+        self.score = 0
+        self.lines = 0
+        self.combo = 1
+        self.paused = False
+        self.downwards_timer = 0
+        self.tetromino_rotation = 0
+
+        return self.state()
+
+    def select_next(self):
+        return random.choice(list_of_tetrominoes)
 
     def set_tetrominoes(self):
         """
         Sets information for the current and next tetrominos
         """
         self.current_tetromino = self.next_tetromino
-        self.next_tetromino = random.choice(list_of_tetrominoes)
+        self.next_tetromino = self.select_next()
         self.surface_of_next_tetromino = self.construct_surface_of_next_tetromino()
         self.tetromino_position = (0,4) if len(self.current_tetromino.shape) == 2 else (0, 3)
         self.tetromino_rotation = 0
@@ -100,79 +165,188 @@ class Matris(object):
         amount = 0
         while self.request_movement('down'):
             amount += 1
-        self.score += 10*amount
+        if self.hard_drop_scores:
+            self.score += 10*amount
 
         self.lock_tetromino()
 
+    def step(self, action, timepassed=0.01):
+        score = self.score
+        lines = self.lines
+        pre_reward = self.reward_metric(self.lines)
+        try:
+            self.perform_action(action)
+            should_redraw = self.update(timepassed)
+            gameover = False
+            next_state = self.state()
+        except GameOver:
+            should_redraw = True
+            gameover = True
+            next_state = self.state(True)
+        post_reward = self.reward_metric(self.lines)
+        reward = -0.0001 + (post_reward - pre_reward)
+        if gameover:
+            reward = -100
+
+        return next_state, float(reward), lines, should_redraw, gameover
+
+    def aggregate_height(self):
+        for x in range(MATRIX_WIDTH):
+            height = 0
+            for y in range(MATRIX_HEIGHT):
+                if self.matrix[(y,x)] is not None:
+                    height = MATRIX_HEIGHT - y
+                    break
+            self.heights[x] = height
+        return sum(self.heights), self.heights
+
+    def holes(self):
+        holes = 0
+        for x in range(MATRIX_WIDTH):
+            for y in range(1, MATRIX_HEIGHT):
+                if self.matrix[(y,x)] is None and self.matrix[(y-1,x)] is not None:
+                    holes += 1
+        return holes
+
+    def bumpy(self):
+        aggregate_height, heights = self.aggregate_height()
+        bumps = 0
+        for h in range(len(heights) - 1):
+            bumps += abs(heights[h] - heights[h+1])
+        return bumps, aggregate_height, heights
+
+    def reward_metric(self, lines):
+        holes = self.holes()
+        bumps, aggregate_height, heights = self.bumpy()
+        return -0.510066 * aggregate_height + 0.760666 * lines + -0.35663 * holes + -0.184483 * bumps
+
+    def empty(self):
+        return np.zeros((2, MATRIX_HEIGHT, MATRIX_WIDTH), dtype=np.float32)
+
+    def state(self, empty=False):
+        with_tetromino = self.blend(shape=self.current_tetromino.shape, position=self.tetromino_position, matrix=self.empty_matrix)
+        state = self.empty()
+        if not empty:
+            try:
+                for y, x in self.matrix:
+                    value = self.matrix[(y,x)]
+                    state[0][y][x] = 0 if value is None else 1
+                for y, x in with_tetromino:
+                    value = with_tetromino[(y,x)]
+                    state[1][y][x] = 0 if value is None else 1
+            except TypeError:
+                pass
+
+        return state
+
+    def perform_action(self, action):
+        if action == Action.LEFT:
+            self.request_movement('left')
+        elif action == Action.RIGHT:
+            self.request_movement('right')
+        elif action == Action.HARD_DROP:
+            self.hard_drop()
+        elif action == Action.ROTATE:
+            self.request_rotation()
+        elif action == Action.DOWN:
+            if not self.request_movement('down'):
+                self.lock_tetromino()
+        self.actions_left -= 1
+        if self.actions_left <= 0:
+            self.actions_left = self.actions_until_drop
+            if not self.request_movement('down'):
+                self.lock_tetromino()
+
+    def get_user_actions(self):
+        pygame.event.get(pygame.KEYDOWN)
+        keyups = pygame.event.get(pygame.KEYUP)
+
+        user_actions = []
+        for event in keyups:
+            if event.key == pygame.K_SPACE:
+                user_actions.append(Action.HARD_DROP)
+            elif event.key == pygame.K_UP or event.key == pygame.K_w:
+                user_actions.append(Action.ROTATE)
+            elif event.key == pygame.K_LEFT or event.key == pygame.K_a:
+                user_actions.append(Action.LEFT)
+            elif event.key == pygame.K_RIGHT or event.key == pygame.K_d:
+                user_actions.append(Action.RIGHT)
+            elif event.key == pygame.K_DOWN or event.key == pygame.K_s:
+                user_actions.append(Action.DOWN)
+        return user_actions
 
     def update(self, timepassed):
         """
         Main game loop
         """
         self.needs_redraw = False
-        
-        pressed = lambda key: event.type == pygame.KEYDOWN and event.key == key
-        unpressed = lambda key: event.type == pygame.KEYUP and event.key == key
 
-        events = pygame.event.get()
-        #Controls pausing and quitting the game.
-        for event in events:
-            if pressed(pygame.K_p):
-                self.surface.fill((0,0,0))
-                self.needs_redraw = True
-                self.paused = not self.paused
-            elif event.type == pygame.QUIT:
-                self.gameover(full_exit=True)
-            elif pressed(pygame.K_ESCAPE):
-                self.gameover()
+        if self.surface:
+            pressed = lambda key: event.type == pygame.KEYDOWN and event.key == key
+            unpressed = lambda key: event.type == pygame.KEYUP and event.key == key
 
-        if self.paused:
-            return self.needs_redraw
+            events = pygame.event.get(eventtype=[pygame.QUIT])
+            #Controls pausing and quitting the game.
+            for event in events:
+                if pressed(pygame.K_p):
+                    self.surface.fill((0,0,0))
+                    self.needs_redraw = True
+                    self.paused = not self.paused
+                elif event.type == pygame.QUIT:
+                    self.gameover(full_exit=True)
+                elif pressed(pygame.K_ESCAPE):
+                    self.gameover()
 
-        for event in events:
-            #Controls movement of the tetromino
-            if pressed(pygame.K_SPACE):
-                self.hard_drop()
-            elif pressed(pygame.K_UP) or pressed(pygame.K_w):
-                self.request_rotation()
-            elif pressed(pygame.K_LEFT) or pressed(pygame.K_a):
-                self.request_movement('left')
-                self.movement_keys['left'] = 1
-            elif pressed(pygame.K_RIGHT) or pressed(pygame.K_d):
-                self.request_movement('right')
-                self.movement_keys['right'] = 1
+            if self.paused:
+                return self.needs_redraw
 
-            elif unpressed(pygame.K_LEFT) or unpressed(pygame.K_a):
-                self.movement_keys['left'] = 0
-                self.movement_keys_timer = (-self.movement_keys_speed)*2
-            elif unpressed(pygame.K_RIGHT) or unpressed(pygame.K_d):
-                self.movement_keys['right'] = 0
-                self.movement_keys_timer = (-self.movement_keys_speed)*2
-
-
-
-
-        self.downwards_speed = self.base_downwards_speed ** (1 + self.level/10.)
-
-        self.downwards_timer += timepassed
-        downwards_speed = self.downwards_speed*0.10 if any([pygame.key.get_pressed()[pygame.K_DOWN],
-                                                            pygame.key.get_pressed()[pygame.K_s]]) else self.downwards_speed
-        if self.downwards_timer > downwards_speed:
-            if not self.request_movement('down'): #Places tetromino if it cannot move further down
-                self.lock_tetromino()
-
-            self.downwards_timer %= downwards_speed
+            # for event in events:
+            #     #Controls movement of the tetromino
+            #     if pressed(pygame.K_SPACE):
+            #         self.hard_drop()
+            #     elif pressed(pygame.K_UP) or pressed(pygame.K_w):
+            #         self.request_rotation()
+            #     elif pressed(pygame.K_LEFT) or pressed(pygame.K_a):
+            #         self.request_movement('left')
+            #         self.movement_keys['left'] = 1
+            #     elif pressed(pygame.K_RIGHT) or pressed(pygame.K_d):
+            #         self.request_movement('right')
+            #         self.movement_keys['right'] = 1
+            #
+            #     elif unpressed(pygame.K_LEFT) or unpressed(pygame.K_a):
+            #         self.movement_keys['left'] = 0
+            #         self.movement_keys_timer = (-self.movement_keys_speed)*2
+            #     elif unpressed(pygame.K_RIGHT) or unpressed(pygame.K_d):
+            #         self.movement_keys['right'] = 0
+            #         self.movement_keys_timer = (-self.movement_keys_speed)*2
 
 
-        if any(self.movement_keys.values()):
-            self.movement_keys_timer += timepassed
-        if self.movement_keys_timer > self.movement_keys_speed:
-            self.request_movement('right' if self.movement_keys['right'] else 'left')
-            self.movement_keys_timer %= self.movement_keys_speed
+        # self.downwards_speed = self.base_downwards_speed ** (1 + self.level/10.)
+
+        # self.downwards_timer += timepassed
+        # downwards_speed = self.downwards_speed*0.10 if any([pygame.key.get_pressed()[pygame.K_DOWN],
+        #                                                     pygame.key.get_pressed()[pygame.K_s]]) else self.downwards_speed
+        # if self.downwards_timer > downwards_speed:
+        #     if not self.request_movement('down'): #Places tetromino if it cannot move further down
+        #         self.lock_tetromino()
+        #
+        #     self.downwards_timer %= downwards_speed
+
+        # if any(self.movement_keys.values()):
+        #     self.movement_keys_timer += timepassed
+        # if self.movement_keys_timer > self.movement_keys_speed:
+        #     self.request_movement('right' if self.movement_keys['right'] else 'left')
+        #     self.movement_keys_timer %= self.movement_keys_speed
         
         return self.needs_redraw
 
+    def surface_check(self):
+        if self.surface is None:
+            self.surface = screen.subsurface(Rect((MATRIS_OFFSET + BORDERWIDTH, MATRIS_OFFSET + BORDERWIDTH),
+                                     (MATRIX_WIDTH * BLOCKSIZE, (MATRIX_HEIGHT - 2) * BLOCKSIZE)))
+
     def draw_surface(self):
+        self.surface_check()
         """
         Draws the image of the current tetromino
         """
@@ -334,17 +508,9 @@ class Matris(object):
         self.lines += lines_cleared
 
         if lines_cleared:
-            if lines_cleared >= 4:
-                self.linescleared_sound.play()
             self.score += 100 * (lines_cleared**2) * self.combo
 
-            if not self.played_highscorebeaten_sound and self.score > self.highscore:
-                if self.highscore != 0:
-                    self.highscorebeaten_sound.play()
-                self.played_highscorebeaten_sound = True
-
         if self.lines >= self.level*10:
-            self.levelup_sound.play()
             self.level += 1
 
         self.combo = self.combo + 1 if lines_cleared else 1
@@ -352,7 +518,6 @@ class Matris(object):
         self.set_tetrominoes()
 
         if not self.blend():
-            self.gameover_sound.play()
             self.gameover()
             
         self.needs_redraw = True
@@ -423,14 +588,16 @@ class Matris(object):
         return surf
 
 class Game(object):
-    def main(self, screen):
+    def main(self, sc, matris):
         """
         Main loop for game
         Redraws scores and next tetromino each time the loop is passed through
         """
-        clock = pygame.time.Clock()
+        self.clock = pygame.time.Clock()
+        global screen
+        screen = sc
 
-        self.matris = Matris()
+        self.matris = matris
         
         screen.blit(construct_nightmare(screen.get_size()), (0,0))
         
@@ -439,15 +606,16 @@ class Game(object):
         screen.blit(matris_border, (MATRIS_OFFSET,MATRIS_OFFSET))
         
         self.redraw()
-
-        while True:
-            try:
-                timepassed = clock.tick(50)
-                if self.matris.update((timepassed / 1000.) if not self.matris.paused else 0):
-                    self.redraw()
-            except GameOver:
-                return
       
+
+    def draw(self, framerate = 50):
+        timepassed = self.clock.tick(framerate)
+        if self.matris.update((timepassed / 1000.) if not self.matris.paused else 0):
+            self.redraw()
+
+    def step(self, timepassed):
+        if self.matris.update(timepassed):
+            self.redraw()
 
     def redraw(self):
         """

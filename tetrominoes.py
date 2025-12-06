@@ -34,6 +34,15 @@ tetrominoes = {
                                   (X,X,X),
                                   (O,O,O)))
 }
+tetrominoes_index = {
+    "blue": 0,
+    "yellow": 1,
+    "pink": 2,
+    "green": 3,
+    "red": 4,
+    "cyan": 5,
+    "orange": 6
+}
 list_of_tetrominoes = list(tetrominoes.values())
 
 def rotate(shape, times=1):
