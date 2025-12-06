@@ -35,13 +35,13 @@ tetrominoes = {
                                   (O,O,O)))
 }
 tetrominoes_index = {
-    "blue": 0,
-    "yellow": 1,
-    "pink": 2,
-    "green": 3,
-    "red": 4,
-    "cyan": 5,
-    "orange": 6
+    "blue": 0+2,
+    "yellow": 1+2,
+    "pink": 2+2,
+    "green": 3+2,
+    "red": 4+2,
+    "cyan": 5+2,
+    "orange": 6+2
 }
 list_of_tetrominoes = list(tetrominoes.values())
 

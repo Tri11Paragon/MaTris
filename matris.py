@@ -41,6 +41,10 @@ TRICKY_CENTERX = WIDTH-(WIDTH-(MATRIS_OFFSET+BLOCKSIZE*MATRIX_WIDTH+BORDERWIDTH*
 
 VISIBLE_MATRIX_HEIGHT = MATRIX_HEIGHT - 2
 
+EMPTY_CELL = 0
+SHADOW_CELL = 1
+COLORED_CELL = 2
+
 class Action(Enum):
     RIGHT = 0
     LEFT = 1
@@ -50,151 +54,163 @@ class Action(Enum):
     # NONE = 5
 
 class Piece:
-    def __init__(self, shape, color, position = None):
+    def __init__(self, shape, color, position = None, rotation=0):
+        self.rotation = rotation
         self.shape = shape
         self.color = color
-        self.position = position if position is not None else ((0,4) if len(shape) == 2 else (0, 3))
+        self.position = position if position is not None else ((2,4) if len(shape) == 2 else (2, 3))
+
+    def copy(self):
+        return Piece(self.shape, self.color, tuple(self.position), self.rotation)
+
+    def rotated(self, rotation=None):
+        """
+        Rotates tetromino
+        """
+        if rotation is None:
+            rotation = self.rotation
+        return Piece(rotate(self.shape, rotation), self.color, self.position, rotation)
+
+    def move(self, y, x):
+        return Piece(self.shape, self.color, (self.position[0] + y, self.position[1] + x), self.rotation)
+
+    def request_rotation(self, grid):
+        """
+        Checks if tetromino can rotate
+        Returns the tetromino's rotation position if possible
+        """
+        rotation = (self.rotation + 1) % 4
+        shape = self.rotated(rotation)
+
+        new_piece = (grid.fits_in_matrix(shape.move(0, 0)) or
+                    grid.fits_in_matrix(shape.move(0, 1)) or
+                    grid.fits_in_matrix(shape.move(0, -1)) or
+                    grid.fits_in_matrix(shape.move(0, +2)) or
+                    grid.fits_in_matrix(shape.move(0, -2)))
+        # ^ That's how wall-kick is implemented
+
+        if new_piece and grid.blend(new_piece) is not False:
+            return new_piece
+        else:
+            return False
+
+    def request_movement(self, grid, direction):
+        """
+        Checks if teteromino can move in the given direction and returns its new position if movement is possible
+        """
+        if direction == 'left' and grid.blend(self.move(0, -1)) is not False:
+            return self.move(0, -1)
+        elif direction == 'right' and grid.blend(self.move(0, 1)) is not False:
+            return self.move(0, 1)
+        elif direction == 'up' and grid.blend(self.move(-1, 0)) is not False:
+            return self.move(-1, 0)
+        elif direction == 'down' and grid.blend(self.move(+1, 0)) is not False:
+            return self.move(+1, 0)
+        else:
+            return False
+
+    def hard_drop(self, grid):
+        """
+        Instantly places tetrominos in the cells below
+        """
+        piece = self.copy()
+
+        amount = 0
+        while True:
+            piece1 = piece.request_movement(grid, 'down')
+            if piece1 is False :
+                break
+            piece = piece1
+            amount += 1
+
+        grid.lock_tetromino(piece)
+
+        return amount
 
 class Grid:
-    def __init__(self, width, height):
+    def __init__(self, height, width):
         self.width = width
         self.height = height
         self.grid = np.zeros((height, width), dtype=np.uint8)
+        self.heights = np.zeros(width, dtype=np.uint32)
 
-    def fits_in_matrix(self, piece: Piece) -> bool:
+    def fits_in_matrix(self, piece: Piece):
         """
         Checks if tetromino fits on the board
         """
         posY, posX = piece.position
         for x in range(posX, posX + len(piece.shape)):
             for y in range(posY, posY + len(piece.shape)):
-                if self.grid[y][x] is False and piece.shape[y - posY][x - posX]:  # outside matrix
+                if x >= self.width and y >= self.height and piece.shape[y - posY][x - posX]:  # outside matrix
                     return False
 
-        return True
+        return piece
 
+    def blend(self, piece: Piece, shadow=False):
+        """
+        Does `shape` at `position` fit in `matrix`? If so, return a new copy of `matrix` where all
+        the squares of `shape` have been placed in `matrix`. Otherwise, return False.
 
+        This method is often used simply as a test, for example to see if an action by the player is valid.
+        It is also used in `self.draw_surface` to paint the falling tetromino and its shadow on the screen.
+        """
 
+        copy = self.grid.copy()
+        posY, posX = piece.position
+        print(piece.position)
+        for x in range(posX, posX + len(piece.shape)):
+            for y in range(posY, posY + len(piece.shape)):
+                if (x >= self.width or y >= self.height  # shape is outside the matrix
+                        or  # coordinate is occupied by something else which isn't a shadow
+                        (copy[y][x] >= COLORED_CELL  and piece.shape[y - posY][x - posX])):
+                    return False  # Blend failed; `shape` at `position` breaks the matrix
 
-class Matris(object):
-    def __init__(self, hard_drop_scores = False, actions_until_drop = 10):
-        self.surface = None
+                elif piece.shape[y - posY][x - posX]:
+                    copy[y][x] = SHADOW_CELL if shadow else piece.color
 
-        self.matrix = dict()
+        return copy
+
+    def clear(self):
+        self.grid[:][:] = 0
+
+    def lock_tetromino(self, piece: Piece):
+        """
+        This method is called whenever the falling tetromino "dies". `self.matrix` is updated,
+        the lines are counted and cleared, and a new tetromino is chosen.
+        """
+        self.grid = self.blend(piece)
+
+        return self.remove_lines()
+
+    def remove_lines(self):
+        """
+        Removes lines from the board
+        """
+        lines = []
         for y in range(MATRIX_HEIGHT):
+            #Checks if row if full, for each row
+            line = (y, [])
             for x in range(MATRIX_WIDTH):
-                self.matrix[(y,x)] = None
+                if self.grid[y][x]:
+                    line[1].append(x)
+            if len(line[1]) == MATRIX_WIDTH:
+                lines.append(y)
 
-        self.heights = dict()
-        for x in range(MATRIX_WIDTH):
-            self.heights[x] = 0
-
-        self.empty_matrix = dict()
-        for y in range(MATRIX_HEIGHT):
+        for line in sorted(lines):
+            #Moves lines down one row
             for x in range(MATRIX_WIDTH):
-                self.empty_matrix[(y, x)] = None
-        """
-        `self.matrix` is the current state of the tetris board, that is, it records which squares are
-        currently occupied. It does not include the falling tetromino. The information relating to the
-        falling tetromino is managed by `self.set_tetrominoes` instead. When the falling tetromino "dies",
-        it will be placed in `self.matrix`.
-        """
+                self.grid[line][x] = 0
+            for y in range(0, line+1)[::-1]:
+                for x in range(MATRIX_WIDTH):
+                    self.grid[y][x] = self.grid[y-1][x]
 
-        self.hard_drop_scores = hard_drop_scores
-
-        self.next_tetromino = random.choice(list_of_tetrominoes)
-        self.set_tetrominoes()
-        self.tetromino_rotation = 0
-        self.downwards_timer = 0
-        self.base_downwards_speed = 0.4 # Move down every 400 ms
-
-        self.movement_keys = {'left': 0, 'right': 0}
-        self.movement_keys_speed = 0.05
-        self.movement_keys_timer = (-self.movement_keys_speed)*2
-
-        self.level = 1
-        self.score = 0
-        self.lines = 0
-
-        self.combo = 1 # Combo will increase when you clear lines with several tetrominos in a row
-        
-        self.paused = False
-
-        self.actions_until_drop = actions_until_drop
-        self.actions_left = self.actions_until_drop
-
-    def reset(self):
-        self.matrix = dict()
-        for y in range(MATRIX_HEIGHT):
-            for x in range(MATRIX_WIDTH):
-                self.matrix[(y,x)] = None
-
-        self.next_tetromino = self.select_next()
-        self.set_tetrominoes()
-
-        self.level = 1
-        self.score = 0
-        self.lines = 0
-        self.combo = 1
-        self.paused = False
-        self.downwards_timer = 0
-        self.tetromino_rotation = 0
-
-        return self.state()
-
-    def select_next(self):
-        return random.choice(list_of_tetrominoes)
-
-    def set_tetrominoes(self):
-        """
-        Sets information for the current and next tetrominos
-        """
-        self.current_tetromino = self.next_tetromino
-        self.next_tetromino = self.select_next()
-        self.surface_of_next_tetromino = self.construct_surface_of_next_tetromino()
-        self.tetromino_position = (0,4) if len(self.current_tetromino.shape) == 2 else (0, 3)
-        self.tetromino_rotation = 0
-        self.tetromino_block = self.block(self.current_tetromino.color)
-        self.shadow_block = self.block(self.current_tetromino.color, shadow=True)
-
-    
-    def hard_drop(self):
-        """
-        Instantly places tetrominos in the cells below
-        """
-        amount = 0
-        while self.request_movement('down'):
-            amount += 1
-        if self.hard_drop_scores:
-            self.score += 10*amount
-
-        self.lock_tetromino()
-
-    def step(self, action, timepassed=0.01):
-        score = self.score
-        lines = self.lines
-        pre_reward = self.reward_metric(self.lines)
-        try:
-            self.perform_action(action)
-            should_redraw = self.update(timepassed)
-            gameover = False
-            next_state = self.state()
-        except GameOver:
-            should_redraw = True
-            gameover = True
-            next_state = self.state(True)
-        post_reward = self.reward_metric(self.lines)
-        reward = -0.0001 + (post_reward - pre_reward)
-        if gameover:
-            reward = -100
-
-        return next_state, float(reward), lines, should_redraw, gameover
+        return len(lines)
 
     def aggregate_height(self):
         for x in range(MATRIX_WIDTH):
             height = 0
             for y in range(MATRIX_HEIGHT):
-                if self.matrix[(y,x)] is not None:
+                if self.grid[y][x] >= COLORED_CELL:
                     height = MATRIX_HEIGHT - y
                     break
             self.heights[x] = height
@@ -204,7 +220,7 @@ class Matris(object):
         holes = 0
         for x in range(MATRIX_WIDTH):
             for y in range(1, MATRIX_HEIGHT):
-                if self.matrix[(y,x)] is None and self.matrix[(y-1,x)] is not None:
+                if self.grid[y][x] < COLORED_CELL <= self.grid[y - 1][x]:
                     holes += 1
         return holes
 
@@ -220,42 +236,113 @@ class Matris(object):
         bumps, aggregate_height, heights = self.bumpy()
         return -0.510066 * aggregate_height + 0.760666 * lines + -0.35663 * holes + -0.184483 * bumps
 
+
+class Matris(object):
+    def __init__(self, actions_until_drop = 10):
+        self.surface = None
+
+        self.grid = Grid(MATRIX_HEIGHT, MATRIX_WIDTH)
+        """
+        `self.matrix` is the current state of the tetris board, that is, it records which squares are
+        currently occupied. It does not include the falling tetromino. The information relating to the
+        falling tetromino is managed by `self.set_tetrominoes` instead. When the falling tetromino "dies",
+        it will be placed in `self.matrix`.
+        """
+
+        self.next_tetromino = self.select_next()
+        self.current_tetromino = self.select_next()
+        self.surface_of_next_tetromino = self.construct_surface_of_next_tetromino()
+        self.tetromino_block = self.block(self.current_tetromino.color)
+        self.shadow_block = self.block(self.current_tetromino.color, shadow=True)
+
+        self.lines = 0
+
+        self.paused = False
+
+        self.actions_until_drop = actions_until_drop
+        self.actions_left = self.actions_until_drop
+
+    def reset(self):
+        self.grid.clear()
+
+        self.next_tetromino = self.select_next()
+        self.set_tetrominoes()
+
+        self.lines = 0
+        self.paused = False
+
+        return self.state()
+
+    def select_next(self):
+        next_tet = random.choice(list_of_tetrominoes)
+        return Piece(next_tet.shape, tetrominoes_index[next_tet.color])
+
+    def set_tetrominoes(self):
+        """
+        Sets information for the current and next tetrominos
+        """
+        self.current_tetromino = self.next_tetromino
+        self.next_tetromino = self.select_next()
+        self.surface_of_next_tetromino = self.construct_surface_of_next_tetromino()
+        self.tetromino_block = self.block(self.current_tetromino.color)
+        self.shadow_block = self.block(self.current_tetromino.color, shadow=True)
+
+        if self.grid.blend(self.current_tetromino) is False:
+            self.gameover()
+
+    def step(self, action, timepassed=0.01):
+        lines = self.lines
+        pre_reward = self.grid.reward_metric(self.lines)
+        try:
+            self.perform_action(action)
+            should_redraw = self.update(timepassed)
+            gameover = False
+            next_state = self.state()
+        except GameOver:
+            should_redraw = True
+            gameover = True
+            next_state = self.state(True)
+        post_reward = self.grid.reward_metric(self.lines)
+        reward = -0.0001 + (post_reward - pre_reward)
+        if gameover:
+            reward = -100
+
+        return next_state, float(reward), lines, should_redraw, gameover
+
     def empty(self):
         return np.zeros((2, MATRIX_HEIGHT, MATRIX_WIDTH), dtype=np.float32)
 
     def state(self, empty=False):
-        with_tetromino = self.blend(shape=self.current_tetromino.shape, position=self.tetromino_position, matrix=self.empty_matrix)
         state = self.empty()
         if not empty:
             try:
-                for y, x in self.matrix:
-                    value = self.matrix[(y,x)]
-                    state[0][y][x] = 0 if value is None else 1
-                for y, x in with_tetromino:
-                    value = with_tetromino[(y,x)]
-                    state[1][y][x] = 0 if value is None else 1
+                state[0] = self.grid.grid.astype(np.float32)
+                grid = self.grid.blend(self.current_tetromino)
+                if grid is not False:
+                    state[1] = grid.astype(np.float32)
             except TypeError:
                 pass
-
         return state
 
     def perform_action(self, action):
         if action == Action.LEFT:
-            self.request_movement('left')
+            self.current_tetromino.request_movement(self.grid, 'left')
         elif action == Action.RIGHT:
-            self.request_movement('right')
+            self.current_tetromino.request_movement(self.grid, 'right')
         elif action == Action.HARD_DROP:
-            self.hard_drop()
+            self.current_tetromino.hard_drop(self.grid)
         elif action == Action.ROTATE:
-            self.request_rotation()
+            self.current_tetromino.request_rotation(self.grid)
         elif action == Action.DOWN:
-            if not self.request_movement('down'):
-                self.lock_tetromino()
+            if self.current_tetromino.request_movement(self.grid, 'down') is False:
+                self.grid.lock_tetromino(self.current_tetromino)
+                self.set_tetrominoes()
         self.actions_left -= 1
         if self.actions_left <= 0:
             self.actions_left = self.actions_until_drop
-            if not self.request_movement('down'):
-                self.lock_tetromino()
+            if self.current_tetromino.request_movement(self.grid, 'down') is False:
+                self.grid.lock_tetromino(self.current_tetromino)
+                self.set_tetrominoes()
 
     def get_user_actions(self):
         pygame.event.get(pygame.KEYDOWN)
@@ -279,7 +366,7 @@ class Matris(object):
         """
         Main game loop
         """
-        self.needs_redraw = False
+        needs_redraw = False
 
         if self.surface:
             pressed = lambda key: event.type == pygame.KEYDOWN and event.key == key
@@ -290,7 +377,7 @@ class Matris(object):
             for event in events:
                 if pressed(pygame.K_p):
                     self.surface.fill((0,0,0))
-                    self.needs_redraw = True
+                    needs_redraw = True
                     self.paused = not self.paused
                 elif event.type == pygame.QUIT:
                     self.gameover(full_exit=True)
@@ -298,47 +385,9 @@ class Matris(object):
                     self.gameover()
 
             if self.paused:
-                return self.needs_redraw
-
-            # for event in events:
-            #     #Controls movement of the tetromino
-            #     if pressed(pygame.K_SPACE):
-            #         self.hard_drop()
-            #     elif pressed(pygame.K_UP) or pressed(pygame.K_w):
-            #         self.request_rotation()
-            #     elif pressed(pygame.K_LEFT) or pressed(pygame.K_a):
-            #         self.request_movement('left')
-            #         self.movement_keys['left'] = 1
-            #     elif pressed(pygame.K_RIGHT) or pressed(pygame.K_d):
-            #         self.request_movement('right')
-            #         self.movement_keys['right'] = 1
-            #
-            #     elif unpressed(pygame.K_LEFT) or unpressed(pygame.K_a):
-            #         self.movement_keys['left'] = 0
-            #         self.movement_keys_timer = (-self.movement_keys_speed)*2
-            #     elif unpressed(pygame.K_RIGHT) or unpressed(pygame.K_d):
-            #         self.movement_keys['right'] = 0
-            #         self.movement_keys_timer = (-self.movement_keys_speed)*2
-
-
-        # self.downwards_speed = self.base_downwards_speed ** (1 + self.level/10.)
-
-        # self.downwards_timer += timepassed
-        # downwards_speed = self.downwards_speed*0.10 if any([pygame.key.get_pressed()[pygame.K_DOWN],
-        #                                                     pygame.key.get_pressed()[pygame.K_s]]) else self.downwards_speed
-        # if self.downwards_timer > downwards_speed:
-        #     if not self.request_movement('down'): #Places tetromino if it cannot move further down
-        #         self.lock_tetromino()
-        #
-        #     self.downwards_timer %= downwards_speed
-
-        # if any(self.movement_keys.values()):
-        #     self.movement_keys_timer += timepassed
-        # if self.movement_keys_timer > self.movement_keys_speed:
-        #     self.request_movement('right' if self.movement_keys['right'] else 'left')
-        #     self.movement_keys_timer %= self.movement_keys_speed
+                return True
         
-        return self.needs_redraw
+        return True
 
     def surface_check(self):
         if self.surface is None:
@@ -350,20 +399,25 @@ class Matris(object):
         """
         Draws the image of the current tetromino
         """
-        with_tetromino = self.blend(matrix=self.place_shadow())
+        # matrix=self.place_shadow()
+        with_tetromino = self.grid.blend(self.current_tetromino)
+        print(with_tetromino)
+
+        if with_tetromino is False:
+            with_tetromino = self.grid.grid
 
         for y in range(MATRIX_HEIGHT):
             for x in range(MATRIX_WIDTH):
 
                 #                                       I hide the 2 first rows by drawing them outside of the surface
                 block_location = Rect(x*BLOCKSIZE, (y*BLOCKSIZE - 2*BLOCKSIZE), BLOCKSIZE, BLOCKSIZE)
-                if with_tetromino[(y,x)] is None:
+                if with_tetromino[y][x] == EMPTY_CELL:
                     self.surface.fill(BGCOLOR, block_location)
                 else:
-                    if with_tetromino[(y,x)][0] == 'shadow':
+                    if with_tetromino[y][x] == SHADOW_CELL:
                         self.surface.fill(BGCOLOR, block_location)
                     
-                    self.surface.blit(with_tetromino[(y,x)][1], block_location)
+                    self.surface.blit(self.tetromino_block, block_location)
                     
     def gameover(self, full_exit=False):
         """
@@ -371,108 +425,25 @@ class Matris(object):
         after a "natural" drop or a hard drop by the player. That is why `self.lock_tetromino`
         is responsible for checking if it's game over.
         """
-
-        write_score(self.score)
         
         if full_exit:
             exit()
         else:
             raise GameOver("Sucker!")
 
-    def place_shadow(self):
-        """
-        Draws shadow of tetromino so player can see where it will be placed
-        """
-        posY, posX = self.tetromino_position
-        while self.blend(position=(posY, posX)):
-            posY += 1
 
-        position = (posY-1, posX)
-
-        return self.blend(position=position, shadow=True)
-
-    def fits_in_matrix(self, shape, position):
-        """
-        Checks if tetromino fits on the board
-        """
-        posY, posX = position
-        for x in range(posX, posX+len(shape)):
-            for y in range(posY, posY+len(shape)):
-                if self.matrix.get((y, x), False) is False and shape[y-posY][x-posX]: # outside matrix
-                    return False
-
-        return position
-                    
-
-    def request_rotation(self):
-        """
-        Checks if tetromino can rotate
-        Returns the tetromino's rotation position if possible
-        """
-        rotation = (self.tetromino_rotation + 1) % 4
-        shape = self.rotated(rotation)
-
-        y, x = self.tetromino_position
-
-        position = (self.fits_in_matrix(shape, (y, x)) or
-                    self.fits_in_matrix(shape, (y, x+1)) or
-                    self.fits_in_matrix(shape, (y, x-1)) or
-                    self.fits_in_matrix(shape, (y, x+2)) or
-                    self.fits_in_matrix(shape, (y, x-2)))
-        # ^ That's how wall-kick is implemented
-
-        if position and self.blend(shape, position):
-            self.tetromino_rotation = rotation
-            self.tetromino_position = position
-            
-            self.needs_redraw = True
-            return self.tetromino_rotation
-        else:
-            return False
-            
-    def request_movement(self, direction):
-        """
-        Checks if teteromino can move in the given direction and returns its new position if movement is possible
-        """
-        posY, posX = self.tetromino_position
-        if direction == 'left' and self.blend(position=(posY, posX-1)):
-            self.tetromino_position = (posY, posX-1)
-            self.needs_redraw = True
-            return self.tetromino_position
-        elif direction == 'right' and self.blend(position=(posY, posX+1)):
-            self.tetromino_position = (posY, posX+1)
-            self.needs_redraw = True
-            return self.tetromino_position
-        elif direction == 'up' and self.blend(position=(posY-1, posX)):
-            self.needs_redraw = True
-            self.tetromino_position = (posY-1, posX)
-            return self.tetromino_position
-        elif direction == 'down' and self.blend(position=(posY+1, posX)):
-            self.needs_redraw = True
-            self.tetromino_position = (posY+1, posX)
-            return self.tetromino_position
-        else:
-            return False
-
-    def rotated(self, rotation=None):
-        """
-        Rotates tetromino
-        """
-        if rotation is None:
-            rotation = self.tetromino_rotation
-        return rotate(self.current_tetromino.shape, rotation)
 
     def block(self, color, shadow=False):
         """
         Sets visual information for tetromino
         """
-        colors = {'blue':   (105, 105, 255),
-                  'yellow': (225, 242, 41),
-                  'pink':   (242, 41, 195),
-                  'green':  (22, 181, 64),
-                  'red':    (204, 22, 22),
-                  'orange': (245, 144, 12),
-                  'cyan':   (10, 255, 226)}
+        colors = [(105, 105, 255),
+                  (225, 242, 41),
+                  (242, 41, 195),
+                  (22, 181, 64),
+                  (204, 22, 22),
+                  (245, 144, 12),
+                  (10, 255, 226)]
 
 
         if shadow:
@@ -481,7 +452,7 @@ class Matris(object):
             end = [] # Adding this to the end will not change the array, thus no alpha value
 
         border = Surface((BLOCKSIZE, BLOCKSIZE), pygame.SRCALPHA, 32)
-        border.fill(list(map(lambda c: c*0.5, colors[color])) + end)
+        border.fill(list(map(lambda c: c*0.5, colors[color - COLORED_CELL])) + end)
 
         borderwidth = 2
 
@@ -489,90 +460,13 @@ class Matris(object):
         boxarr = pygame.PixelArray(box)
         for x in range(len(boxarr)):
             for y in range(len(boxarr)):
-                boxarr[x][y] = tuple(list(map(lambda c: min(255, int(c*random.uniform(0.8, 1.2))), colors[color])) + end) 
+                boxarr[x][y] = tuple(list(map(lambda c: min(255, int(c*random.uniform(0.8, 1.2))), colors[color - COLORED_CELL])) + end)
 
         del boxarr # deleting boxarr or else the box surface will be 'locked' or something like that and won't blit.
         border.blit(box, Rect(borderwidth, borderwidth, 0, 0))
 
 
         return border
-
-    def lock_tetromino(self):
-        """
-        This method is called whenever the falling tetromino "dies". `self.matrix` is updated,
-        the lines are counted and cleared, and a new tetromino is chosen.
-        """
-        self.matrix = self.blend()
-
-        lines_cleared = self.remove_lines()
-        self.lines += lines_cleared
-
-        if lines_cleared:
-            self.score += 100 * (lines_cleared**2) * self.combo
-
-        if self.lines >= self.level*10:
-            self.level += 1
-
-        self.combo = self.combo + 1 if lines_cleared else 1
-
-        self.set_tetrominoes()
-
-        if not self.blend():
-            self.gameover()
-            
-        self.needs_redraw = True
-
-    def remove_lines(self):
-        """
-        Removes lines from the board
-        """
-        lines = []
-        for y in range(MATRIX_HEIGHT):
-            #Checks if row if full, for each row
-            line = (y, [])
-            for x in range(MATRIX_WIDTH):
-                if self.matrix[(y,x)]:
-                    line[1].append(x)
-            if len(line[1]) == MATRIX_WIDTH:
-                lines.append(y)
-
-        for line in sorted(lines):
-            #Moves lines down one row
-            for x in range(MATRIX_WIDTH):
-                self.matrix[(line,x)] = None
-            for y in range(0, line+1)[::-1]:
-                for x in range(MATRIX_WIDTH):
-                    self.matrix[(y,x)] = self.matrix.get((y-1,x), None)
-
-        return len(lines)
-
-    def blend(self, shape=None, position=None, matrix=None, shadow=False):
-        """
-        Does `shape` at `position` fit in `matrix`? If so, return a new copy of `matrix` where all
-        the squares of `shape` have been placed in `matrix`. Otherwise, return False.
-        
-        This method is often used simply as a test, for example to see if an action by the player is valid.
-        It is also used in `self.draw_surface` to paint the falling tetromino and its shadow on the screen.
-        """
-        if shape is None:
-            shape = self.rotated()
-        if position is None:
-            position = self.tetromino_position
-
-        copy = dict(self.matrix if matrix is None else matrix)
-        posY, posX = position
-        for x in range(posX, posX+len(shape)):
-            for y in range(posY, posY+len(shape)):
-                if (copy.get((y, x), False) is False and shape[y-posY][x-posX] # shape is outside the matrix
-                    or # coordinate is occupied by something else which isn't a shadow
-                    copy.get((y,x)) and shape[y-posY][x-posX] and copy[(y,x)][0] != 'shadow'):
-
-                    return False # Blend failed; `shape` at `position` breaks the matrix
-
-                elif shape[y-posY][x-posX]:
-                    copy[(y,x)] = ('shadow', self.shadow_block) if shadow else ('block', self.tetromino_block)
-
-        return copy
 
     def construct_surface_of_next_tetromino(self):
         """
@@ -649,15 +543,12 @@ class Game(object):
             return surf
         
         #Resizes side panel to allow for all information to be display there.
-        scoresurf = renderpair("Score", self.matris.score)
-        levelsurf = renderpair("Level", self.matris.level)
+        # scoresurf = renderpair("Score", self.matris.score)
+        # levelsurf = renderpair("Level", self.matris.level)
         linessurf = renderpair("Lines", self.matris.lines)
-        combosurf = renderpair("Combo", "x{}".format(self.matris.combo))
+        # combosurf = renderpair("Combo", "x{}".format(self.matris.combo))
 
-        height = 20 + (levelsurf.get_rect().height + 
-                       scoresurf.get_rect().height +
-                       linessurf.get_rect().height + 
-                       combosurf.get_rect().height )
+        height = 20 + linessurf.get_rect().height
         
         #Colours side panel
         area = Surface((width, height))
@@ -665,10 +556,10 @@ class Game(object):
         area.fill(BGCOLOR, Rect(BORDERWIDTH, BORDERWIDTH, width-BORDERWIDTH*2, height-BORDERWIDTH*2))
         
         #Draws side panel
-        area.blit(levelsurf, (0,0))
-        area.blit(scoresurf, (0, levelsurf.get_rect().height))
-        area.blit(linessurf, (0, levelsurf.get_rect().height + scoresurf.get_rect().height))
-        area.blit(combosurf, (0, levelsurf.get_rect().height + scoresurf.get_rect().height + linessurf.get_rect().height))
+        # area.blit(levelsurf, (0,0))
+        # area.blit(scoresurf, (0, levelsurf.get_rect().height))
+        area.blit(linessurf, (0, 0))
+        # area.blit(combosurf, (0, levelsurf.get_rect().height + scoresurf.get_rect().height + linessurf.get_rect().height))
 
         screen.blit(area, area.get_rect(bottom=HEIGHT-MATRIS_OFFSET, centerx=TRICKY_CENTERX))
 
