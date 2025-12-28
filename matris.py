@@ -46,12 +46,13 @@ SHADOW_CELL = 1
 COLORED_CELL = 2
 
 class Action(Enum):
-    RIGHT = 0
-    LEFT = 1
-    DOWN = 2
-    ROTATE = 3
-    HARD_DROP = 4
-    NONE = 5
+    NONE = 0
+    RIGHT = 1
+    LEFT = 2
+    DOWN = 3
+    ROTATE = 4
+    HARD_DROP = 5
+
 
 class Piece:
     def __init__(self, shape, color, position = None, rotation=0):
@@ -152,6 +153,12 @@ class Grid:
         self.grid = np.zeros((height, width), dtype=np.uint8)
         self.heights = np.zeros(width, dtype=np.int32)
 
+    def from_state(self, state):
+        grid = state[0]
+        self.grid = grid.astype(np.uint8)
+        self.heights = np.zeros(self.width, dtype=np.int32)
+        return self
+
     def copy(self):
         grid = Grid(self.height, self.width)
         grid.grid = self.grid.copy()
@@ -206,7 +213,7 @@ class Grid:
                 if copy[y][x] >= COLORED_CELL:
                     # print(f"COLLISION {copy[y][x]} @ ({y}, {x})")
                     return False
-                copy[y][x] = SHADOW_CELL if shadow else piece.color
+                copy[y][x] = SHADOW_CELL if shadow else COLORED_CELL
 
         return copy
 
@@ -265,12 +272,27 @@ class Grid:
             self.heights[x] = height
         return sum(self.heights), self.heights
 
-    def holes(self):
+    def holes_old(self):
         holes = 0
         for x in range(MATRIX_WIDTH):
             for y in range(1, MATRIX_HEIGHT):
                 if self.grid[y][x] < COLORED_CELL <= self.grid[y - 1][x]:
                     holes += 1
+        return holes
+
+    def holes(self):
+        holes = 0
+        for x in range(MATRIX_WIDTH):
+            covered_squares = 0
+            for y in reversed(range(0, MATRIX_HEIGHT)):
+                # If the square is empty then we can increase the number of covered squares
+                if self.grid[y][x] < COLORED_CELL:
+                    covered_squares += 1
+                # Otherwise, if it is full, we add the collected total of covered squares.
+                # This allows us to account for multiple overhangs which we do not want.
+                elif self.grid[y][x] >= COLORED_CELL:
+                    holes += covered_squares
+                    covered_squares = 0
         return holes
 
     def bumpy(self):
@@ -280,12 +302,32 @@ class Grid:
             bumps += abs(heights[h] - heights[h+1])
         return bumps, aggregate_height, heights
 
+    def row_filled(self):
+        # compute the number of fully filled rows
+        total = 0
+        for y in range(1, MATRIX_HEIGHT):
+            sub_total = 0
+            for x in range(MATRIX_WIDTH):
+                if self.grid[y][x] >= COLORED_CELL:
+                    sub_total += 1
+            total += sub_total / MATRIX_WIDTH
+        return total / MATRIX_HEIGHT
+
+    def brett_reward_metric(self):
+        if self.grid is False or self.grid is None:
+            return -np.inf
+        return 0
+
+
     def reward_metric(self, lines):
         if self.grid is False or self.grid is None:
             return -np.inf
         holes = self.holes()
         bumps, aggregate_height, heights = self.bumpy()
-        return -0.510066 * aggregate_height + 0.760666 * lines + -0.35663 * holes + -0.184483 * bumps
+        rows = self.row_filled() ** 4
+        # return -0.510066 * aggregate_height + 0.760666 * lines + -0.35663 * holes + -0.184483 * bumps
+        # from https://gyanigk.github.io/data/DMU_Final_Paper.pdf
+        return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1) + 10 * rows
 
 
 class Matris(object):
@@ -384,7 +426,7 @@ class Matris(object):
         self.lines = 0
         self.score = 0
 
-        return self.state()
+        return self.state(self.grid)
 
     def select_next(self):
         next_tet = random.choice(list_of_tetrominoes)
@@ -401,41 +443,35 @@ class Matris(object):
             self.gameover()
 
     def step(self, action, decay=True):
-        # pre_reward = self.grid.reward_metric(self.lines)
-        score = self.lines
+        if type(action) == int:
+            action = Action(action)
+        pre_reward = self.grid.reward_metric(self.lines)
         try:
             self.perform_action(action, decay=decay)
             game_over = False
-            next_state = self.state()
+            next_state = self.state(self.grid)
         except GameOver:
             game_over = True
-            next_state = self.state(True)
-        # post_reward = self.grid.reward_metric(self.lines)
-        reward = -0.000001 + (self.lines - score) ** 2
+            next_state = self.state(self.grid, True)
+        post_reward = self.grid.reward_metric(self.lines)
+        # reward = -0.000001 + (self.lines - score) ** 2
+        reward = (post_reward - pre_reward) ** 2
+        if action in [Action.LEFT, Action.RIGHT, Action.ROTATE]:
+            reward -= 0.000001 * abs(reward)
         if game_over:
-            reward = -1000
+            reward -= 100
 
+        # print(reward)
         return next_state, float(reward), game_over
 
     def empty(self):
-        return np.zeros((3, MATRIX_HEIGHT, MATRIX_WIDTH), dtype=np.float32)
+        return np.zeros((2, MATRIX_HEIGHT, MATRIX_WIDTH), dtype=np.float32)
 
-    def state(self, empty=False):
+    def state(self, grid, empty=False):
         state = self.empty()
         if not empty:
-            try:
-                write_grid = self.grid.copy()
-                write_grid.clear()
-                state[0] = self.grid.grid.astype(np.float32)
-                grid = write_grid.blend(self.current_tetromino)
-                if grid is not False:
-                    state[1] = grid.astype(np.float32)
-                write_grid.clear()
-                grid = write_grid.blend(self.next_tetromino)
-                if grid is not False:
-                    state[2] = grid.astype(np.float32)
-            except TypeError:
-                pass
+            state[0] = grid.grid.astype(np.float32)
+            state[1] = grid.blend(self.current_tetromino, matrix=state[1])
         return state
 
     def scored(self, lines):
@@ -456,8 +492,106 @@ class Matris(object):
         self.place_tetromino(self.current_tetromino)
         self.set_tetrominoes()
 
+    def get_best_column_action(self):
+        piece = self.current_tetromino.copy()
+
+        best_action = (0, 0)
+        best_score = -np.inf
+
+        for rotation in range(4):
+            new_piece = piece.copy()
+            new_piece.rotation = rotation
+
+            if self.grid.blend(new_piece) is False:
+                continue
+            piece = new_piece
+
+            while piece.mut_move_left(self.grid):
+                pass
+
+            for i in range(MATRIX_WIDTH):
+                copy = piece.copy()
+                grid = self.grid.copy()
+                while copy.mut_move_down(grid):
+                    pass
+
+                grid.place_tetromino(copy)
+                lines = grid.remove_lines()
+                score = grid.reward_metric(lines)
+
+                if score > best_score:
+                    best_action = (rotation, i)
+                    best_score = score
+
+                piece.mut_move_right(grid)
+
+        return best_action
+
+    def get_columns_state(self):
+        piece = self.current_tetromino.copy()
+
+        states = {
+            0: {},
+            1: {},
+            2: {},
+            3: {}
+        }
+
+        for rotation in range(4):
+            new_piece = piece.copy()
+            new_piece.rotation = rotation
+
+            if self.grid.blend(new_piece) is False:
+                continue
+            piece = new_piece
+
+            while piece.mut_move_left(self.grid):
+                pass
+
+            for i in range(MATRIX_WIDTH):
+                copy = piece.copy()
+                grid = self.grid.copy()
+                while copy.mut_move_down(grid):
+                    pass
+
+                grid.place_tetromino(copy)
+                grid.remove_lines()
+
+                states[rotation][i] = self.state(grid)
+                piece.mut_move_right(grid)
+
+        return states
+
+    def place_in_column(self, rotation, column):
+        cy, cx = self.current_tetromino.position
+
+        diff = cx - column
+
+        score = self.lines
+        for i in range(rotation):
+            self.perform_action(Action.ROTATE, False)
+        try:
+            if diff > 0:
+                for i in range(diff):
+                    self.perform_action(Action.LEFT, False)
+            elif diff < 0:
+                for i in range(-diff):
+                    self.perform_action(Action.RIGHT, False)
+
+            self.perform_action(Action.HARD_DROP, False)
+            game_over = False
+            next_state = self.state(self.grid)
+        except GameOver:
+            game_over = True
+            next_state = self.state(self.grid, True)
+        reward = (self.lines - score) ** 2
+        if game_over:
+            reward = -1000
+
+        return next_state, float(reward), game_over
+
+
     def perform_action(self, action, decay=True):
-        v = None
         match action:
             case Action.LEFT:
                 self.current_tetromino.mut_move_left(self.grid)
@@ -474,7 +608,7 @@ class Matris(object):
                 new_piece = self.current_tetromino.request_rotation(self.grid)
                 if new_piece is not False and new_piece is not None:
                     self.current_tetromino = new_piece
-        if decay:
+        if decay and action is not Action.DOWN:
             self.actions_left -= 1
             if self.actions_left <= 0:
                 self.actions_left = self.actions_until_drop
@@ -505,6 +639,7 @@ class Game(object):
         screen = sc
 
         self.matris = matris
+        self.extra_keys = []
         
         screen.blit(construct_nightmare(screen.get_size()), (0,0))
         
@@ -515,6 +650,7 @@ class Game(object):
         self.redraw()
 
     def get_user_actions(self):
+        self.extra_keys = []
         pygame.event.get(pygame.KEYDOWN)
         keyups = pygame.event.get(pygame.KEYUP)
 
@@ -532,7 +668,12 @@ class Game(object):
                 user_actions.append(Action.DOWN)
             elif event.key == pygame.K_ESCAPE:
                 self.matris.gameover()
+            else:
+                self.extra_keys.append(event.key)
         return user_actions
+
+    def is_key(self, key):
+        return pygame.key.get_pressed()[key]
 
     def update(self):
         """
@@ -624,7 +765,7 @@ class Game(object):
             end = []  # Adding this to the end will not change the array, thus no alpha value
 
         border = Surface((BLOCKSIZE, BLOCKSIZE), pygame.SRCALPHA, 32)
-        border.fill(list(map(lambda c: c * 0.5, colors[color - COLORED_CELL])) + end)
+        border.fill(list(map(lambda c: c * 0.5, colors[0])) + end)
 
         borderwidth = 2
 
@@ -632,7 +773,7 @@ class Game(object):
         boxarr = pygame.PixelArray(box)
         for x in range(len(boxarr)):
             for y in range(len(boxarr)):
-                boxarr[x][y] = tuple(list(map(lambda c: min(255, int(c * random.uniform(0.8, 1.2))), colors[color - COLORED_CELL])) + end)
+                boxarr[x][y] = tuple(list(map(lambda c: min(255, int(c * random.uniform(0.8, 1.2))), colors[0])) + end)
 
         del boxarr  # deleting boxarr or else the box surface will be 'locked' or something like that and won't blit.
         border.blit(box, Rect(borderwidth, borderwidth, 0, 0))
