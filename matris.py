@@ -324,9 +324,9 @@ class Grid:
             return -np.inf
         holes = self.holes()
         bumps, aggregate_height, heights = self.bumpy()
-        # return -0.510066 * aggregate_height + 0.760666 * lines + -0.35663 * holes + -0.184483 * bumps
+        return -0.510066 * aggregate_height + 0.760666 * (lines * lines) + -0.35663 * holes + -0.184483 * bumps
         # from https://gyanigk.github.io/data/DMU_Final_Paper.pdf
-        return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
+        # return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
 
 
 class Matris(object):
@@ -455,8 +455,8 @@ class Matris(object):
         post_reward = self.grid.reward_metric(self.lines)
         # reward = -0.000001 + (self.lines - score) ** 2
         reward = post_reward - pre_reward
-        # if action in [Action.LEFT, Action.RIGHT, Action.ROTATE]:
-        #     reward -= 0.0001 * abs(reward)
+        if action in [Action.LEFT, Action.RIGHT, Action.ROTATE]:
+            reward -= 0.0001 * abs(reward)
         if game_over:
             reward -= 100
 
