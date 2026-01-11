@@ -90,7 +90,7 @@ class Piece:
                     grid.fits_in_matrix(shape.move(0, -2)))
         # ^ That's how wall-kick is implemented
 
-        if new_piece and grid.blend(new_piece) is not False:
+        if new_piece and (grid.blend(new_piece) is not False):
             return Piece(self.shape, self.color, new_piece.position, rotation)
         else:
             return False
@@ -217,6 +217,37 @@ class Grid:
 
         return copy
 
+    def blend2(self, piece: Piece, shadow=False, matrix=None):
+        """
+        Does `shape` at `position` fit in `matrix`? If so, return a new copy of `matrix` where all
+        the squares of `shape` have been placed in `matrix`. Otherwise, return False.
+
+        This method is often used simply as a test, for example to see if an action by the player is valid.
+        It is also used in `self.draw_surface` to paint the falling tetromino and its shadow on the screen.
+        """
+        piece = piece.rotated()
+        print(piece.shape)
+        matrix = matrix if (matrix is not None and matrix is not False) else self.grid
+        copy = matrix.copy()
+        posY, posX = piece.position
+        for x in range(posX, posX + len(piece.shape)):
+            for y in range(posY, posY + len(piece.shape)):
+                if piece.shape[y-posY][x-posX] is None:
+                    continue
+                if x >= self.width or y >= self.height or x < 0:  # shape is outside the matrix
+                    print(f"Shape is outside the bounds {x} {y}")
+                    # print(f"OUT OF BOUNDS ({y}, {x})")
+                    return False  # Blend failed; `shape` at `position` breaks the matrix
+                # coordinate is occupied by something else which isn't a shadow
+                if copy[y][x] >= COLORED_CELL:
+                    print(f"Space is already occupied {x} {y}")
+                    # print(f"COLLISION {copy[y][x]} @ ({y}, {x})")
+                    return False
+                copy[y][x] = SHADOW_CELL if shadow else COLORED_CELL
+                print(copy)
+
+        return copy
+
     def clear(self):
         self.grid[:][:] = 0
 
@@ -316,10 +347,23 @@ class Grid:
     def brett_reward_metric(self):
         if self.grid is False or self.grid is None:
             return -np.inf
-        return 0
+        aggregate_height, heights = self.aggregate_height()
+        max_height = min(heights)
 
+        filled = 0
+        empty = 0
+        for j in range(max_height, self.height):
+            for i in range(self.width):
+                if self.grid[j][i] >= COLORED_CELL:
+                    filled += 1
+                else:
+                    empty += 1
 
-    def reward_metric(self, lines):
+        ratio = filled / (empty + 1)
+
+        return (ratio ** 4) * 100
+
+    def paper_reward(self, lines):
         if self.grid is False or self.grid is None:
             return -np.inf
         holes = self.holes()
@@ -327,6 +371,10 @@ class Grid:
         return -0.510066 * aggregate_height + 0.760666 * (lines * lines) + -0.35663 * holes + -0.184483 * bumps
         # from https://gyanigk.github.io/data/DMU_Final_Paper.pdf
         # return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
+
+    def reward_metric(self, lines):
+        # return self.brett_reward_metric() + lines * lines
+        return self.paper_reward(lines)
 
 
 class Matris(object):
@@ -456,9 +504,9 @@ class Matris(object):
         # reward = -0.000001 + (self.lines - score) ** 2
         reward = post_reward - pre_reward
         if action in [Action.LEFT, Action.RIGHT, Action.ROTATE]:
-            reward -= 0.0001 * abs(reward)
-        if game_over:
-            reward -= 100
+            reward -= 0.0001 * (abs(reward) + 1)
+        # if game_over:
+        #     reward -= 100
 
         # print(reward)
         return next_state, float(reward), game_over
@@ -484,12 +532,14 @@ class Matris(object):
             self.score += 400
             
     def place_tetromino(self, piece):
-        self.grid.place_tetromino(piece)
+        if not self.grid.place_tetromino(piece):
+            raise RuntimeError("I FAILED TO SAVE THE STATE!")
         self.scored(self.grid.remove_lines())
         
     def place_current(self):
         self.place_tetromino(self.current_tetromino)
         self.set_tetrominoes()
+        self.reset_action_counter()
 
     def get_best_column_action(self):
         piece = self.current_tetromino.copy()
@@ -589,8 +639,14 @@ class Matris(object):
 
         return next_state, float(reward), game_over
 
+    def reset_action_counter(self, actions_until_drop=None):
+        if actions_until_drop is not None:
+            self.actions_until_drop = actions_until_drop
+        self.actions_left = self.actions_until_drop
 
     def perform_action(self, action, decay=True):
+        # print(action)
+
         match action:
             case Action.LEFT:
                 self.current_tetromino.mut_move_left(self.grid)
@@ -599,18 +655,31 @@ class Matris(object):
             case Action.DOWN:
                 if not self.current_tetromino.mut_move_down(self.grid):
                     self.place_current()
+                if not self.current_tetromino.try_move_down(self.grid):
+                    self.place_current()
+                    return
             case Action.HARD_DROP:
-                new_piece = self.current_tetromino.hard_drop(self.grid)
-                self.place_tetromino(new_piece)
-                self.set_tetrominoes()
+                self.current_tetromino = self.current_tetromino.hard_drop(self.grid)
+                self.place_current()
             case Action.ROTATE:
+                if not self.current_tetromino.try_move_down(self.grid):
+                    self.place_current()
+                old_piece = self.current_tetromino.copy()
                 new_piece = self.current_tetromino.request_rotation(self.grid)
-                if new_piece is not False and new_piece is not None:
+                if new_piece is not False:
                     self.current_tetromino = new_piece
-        if decay and action is not Action.DOWN:
+
+                if not self.current_tetromino.try_move_down(self.grid):
+                    blended = self.grid.blend(self.current_tetromino)
+                    if blended is False:
+                        self.current_tetromino = old_piece
+                    self.place_current()
+                    return
+
+        if decay and (action is not Action.DOWN):
             self.actions_left -= 1
             if self.actions_left <= 0:
-                self.actions_left = self.actions_until_drop
+                self.reset_action_counter()
                 if not self.current_tetromino.mut_move_down(self.grid):
                     self.place_current()
 
