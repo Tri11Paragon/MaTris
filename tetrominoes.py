@@ -2,7 +2,7 @@ from __future__ import print_function
 from collections import namedtuple
 
 X, O = 'X', None
-Tetromino = namedtuple("Tetrimino", "color shape")
+Tetromino = namedtuple("Tetromino", "color shape")
 
 tetrominoes = {
     "long": Tetromino(color="blue",

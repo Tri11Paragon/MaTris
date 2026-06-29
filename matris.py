@@ -13,6 +13,7 @@ from MaTris.scores import load_score, write_score
 from enum import Enum
 
 from MaTris.tetrominoes import tetrominoes_index
+from config import DotDict
 
 
 class GameOver(Exception):
@@ -46,13 +47,34 @@ SHADOW_CELL = 1
 COLORED_CELL = 2
 
 class Action(Enum):
-    NONE = 0
-    RIGHT = 1
-    LEFT = 2
-    DOWN = 3
-    ROTATE = 4
-    HARD_DROP = 5
+    # NONE = 0
+    RIGHT = 0
+    LEFT = 1
+    DOWN = 2
+    ROTATE = 3
+    HARD_DROP = 4
 
+class PerformedAction(Enum):
+    NONE = 0
+    PLACED = 1
+    HIT_EDGE = 2
+    OVER_ROTATED = 3
+
+class PieceSelector:
+    def __init__(self):
+        self.bag = []
+        self.reset()
+
+    def reset(self):
+        self.bag = []
+        for i in list_of_tetrominoes:
+            self.bag.append(i)
+        random.shuffle(self.bag)
+
+    def select(self):
+        if len(self.bag) == 0:
+            self.reset()
+        return self.bag.pop()
 
 class Piece:
     def __init__(self, shape, color, position = None, rotation=0):
@@ -89,11 +111,13 @@ class Piece:
                     grid.fits_in_matrix(shape.move(0, +2)) or
                     grid.fits_in_matrix(shape.move(0, -2)))
         # ^ That's how wall-kick is implemented
+        if not new_piece:
+            return None
+        new_piece = Piece(self.shape, self.color, new_piece.position, rotation)
 
-        if new_piece and (grid.blend(new_piece) is not False):
-            return Piece(self.shape, self.color, new_piece.position, rotation)
-        else:
-            return False
+        if grid.blend(new_piece) is not False:
+            return new_piece
+        return None
         
     def try_move_left(self, grid):
         if grid.blend(self.move(0, -1)) is not False:
@@ -217,37 +241,6 @@ class Grid:
 
         return copy
 
-    def blend2(self, piece: Piece, shadow=False, matrix=None):
-        """
-        Does `shape` at `position` fit in `matrix`? If so, return a new copy of `matrix` where all
-        the squares of `shape` have been placed in `matrix`. Otherwise, return False.
-
-        This method is often used simply as a test, for example to see if an action by the player is valid.
-        It is also used in `self.draw_surface` to paint the falling tetromino and its shadow on the screen.
-        """
-        piece = piece.rotated()
-        print(piece.shape)
-        matrix = matrix if (matrix is not None and matrix is not False) else self.grid
-        copy = matrix.copy()
-        posY, posX = piece.position
-        for x in range(posX, posX + len(piece.shape)):
-            for y in range(posY, posY + len(piece.shape)):
-                if piece.shape[y-posY][x-posX] is None:
-                    continue
-                if x >= self.width or y >= self.height or x < 0:  # shape is outside the matrix
-                    print(f"Shape is outside the bounds {x} {y}")
-                    # print(f"OUT OF BOUNDS ({y}, {x})")
-                    return False  # Blend failed; `shape` at `position` breaks the matrix
-                # coordinate is occupied by something else which isn't a shadow
-                if copy[y][x] >= COLORED_CELL:
-                    print(f"Space is already occupied {x} {y}")
-                    # print(f"COLLISION {copy[y][x]} @ ({y}, {x})")
-                    return False
-                copy[y][x] = SHADOW_CELL if shadow else COLORED_CELL
-                print(copy)
-
-        return copy
-
     def clear(self):
         self.grid[:][:] = 0
 
@@ -344,41 +337,59 @@ class Grid:
             total += sub_total / MATRIX_WIDTH
         return total / MATRIX_HEIGHT
 
-    def brett_reward_metric(self):
-        if self.grid is False or self.grid is None:
-            return -np.inf
+    def brett_reward_metric(self, lines):
         aggregate_height, heights = self.aggregate_height()
-        max_height = min(heights)
+
+        max_height = max(heights)
+        height = MATRIX_HEIGHT - max_height
+
+        total_reward = 0
 
         filled = 0
         empty = 0
-        for j in range(max_height, self.height):
+        for j in range(height, self.height):
+            row_filled = 0
+            row_empty = 0
             for i in range(self.width):
                 if self.grid[j][i] >= COLORED_CELL:
-                    filled += 1
+                    row_filled += 1
                 else:
-                    empty += 1
+                    row_empty += 1
+            filled += row_filled
+            empty += row_empty
 
-        ratio = filled / (empty + 1)
+            # total_reward += (row_filled / (row_empty + row_filled + 1)) ** 2
+
+        # total_reward *= height
+        # total_reward += lines * lines * height
+
+        ratio = filled / (empty + filled + 1)
+
+        # total_reward += ratio ** 2
 
         return (ratio ** 4) * 100
 
     def paper_reward(self, lines):
-        if self.grid is False or self.grid is None:
-            return -np.inf
         holes = self.holes()
         bumps, aggregate_height, heights = self.bumpy()
         return -0.510066 * aggregate_height + 0.760666 * (lines * lines) + -0.35663 * holes + -0.184483 * bumps
+
+    def paper_reward2(self, lines):
+        holes = self.holes()
+        bumps, aggregate_height, heights = self.bumpy()
         # from https://gyanigk.github.io/data/DMU_Final_Paper.pdf
-        # return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
+        return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
 
     def reward_metric(self, lines):
-        # return self.brett_reward_metric() + lines * lines
+        if self.grid is False or self.grid is None:
+            return -np.inf
+        # return self.brett_reward_metric(lines) + self.paper_reward(lines)
+        # return self.paper_reward(lines)
         return self.paper_reward(lines)
 
 
 class Matris(object):
-    def __init__(self, actions_until_drop = 10):
+    def __init__(self, config):
         self.grid = Grid(MATRIX_HEIGHT, MATRIX_WIDTH)
         """
         `self.matrix` is the current state of the tetris board, that is, it records which squares are
@@ -387,16 +398,27 @@ class Matris(object):
         it will be placed in `self.matrix`.
         """
 
+        self.piece_selector = PieceSelector()
+
         self.next_tetromino = self.select_next()
         self.current_tetromino = self.select_next()
 
         self.lines = 0
         self.score = 0
 
-        self.actions_until_drop = actions_until_drop
-        self.actions_left = self.actions_until_drop
+        self.config = config
 
-    def best_action_set(self, hard_drop_epsilon = 0.01):
+        self.actions_left = config.tetris.decay.actionsUntilDrop
+        self.placement_horizon_counter = config.tetris.truncate.placementTimer.value
+
+        self.average_reward = 0
+        self.last_moves = []
+        self.is_game_over = False
+
+    def back_or_none(self):
+        return self.last_moves[-1] if len(self.last_moves) > 0 else None
+
+    def best_action_set(self, hard_drop_epsilon = 0.01, decay = True):
         best_actions = None
         best_score = -np.inf
         piece = self.current_tetromino.copy()
@@ -408,6 +430,7 @@ class Matris(object):
             # new_piece = piece.request_rotation(self.grid)
             new_piece = piece.copy()
             new_piece.rotation = rotation
+            # invalid state
             if self.grid.blend(new_piece) is False:
                 continue
             piece = new_piece
@@ -436,7 +459,7 @@ class Matris(object):
                     break
 
         if best_actions is None:
-            return [Action.NONE]
+            return []
 
         actions = []
         old_y, old_x = self.current_tetromino.position
@@ -444,7 +467,7 @@ class Matris(object):
 
         diff_x = old_x - new_x
 
-        for i in range(best_actions[0]):
+        for i in range((best_actions[0] - self.current_tetromino.rotation) % 4):
             actions.append(Action.ROTATE)
 
         if diff_x > 0:
@@ -460,7 +483,6 @@ class Matris(object):
             piece = best_actions[2].copy()
             while piece.mut_move_down(self.grid):
                 actions.append(Action.DOWN)
-            actions.append(Action.DOWN)
 
         return actions
 
@@ -469,47 +491,92 @@ class Matris(object):
 
         self.next_tetromino = self.select_next()
         self.set_tetrominoes()
+        self.reset_action_counter()
 
         self.lines = 0
         self.score = 0
+        self.average_reward = 0
+        self.last_moves = []
+        self.is_game_over = False
 
         return self.state(self.grid)
 
     def select_next(self):
-        next_tet = random.choice(list_of_tetrominoes)
+        next_tet = self.piece_selector.select()
         return Piece(next_tet.shape, tetrominoes_index[next_tet.color])
 
     def set_tetrominoes(self):
         """
         Sets information for the current and next tetrominos
         """
+        self.placement_horizon_counter = self.config.tetris.truncate.placementTimer.value
+
         self.current_tetromino = self.next_tetromino
         self.next_tetromino = self.select_next()
 
         if self.grid.blend(self.current_tetromino) is False:
             self.gameover()
 
-    def step(self, action, decay=True):
+    def step(self, action):
         if type(action) == int:
             action = Action(action)
-        pre_reward = self.grid.reward_metric(self.lines)
+        lines = self.lines
+        pre_reward = self.grid.reward_metric(0)
+        game_over = False
+        truncated = False
+
         try:
-            self.perform_action(action, decay=decay)
-            game_over = False
+            action_result = self.perform_action(action, decay=self.config.tetris.decay.enabled)
+            if action_result == PerformedAction.PLACED and self.config.truncate.piecePlacementTruncates:
+                truncated = True
             next_state = self.state(self.grid)
         except GameOver:
+            action_result = PerformedAction.NONE
             game_over = True
+            self.is_game_over = True
             next_state = self.state(self.grid, True)
-        post_reward = self.grid.reward_metric(self.lines)
-        # reward = -0.000001 + (self.lines - score) ** 2
+
+        lines_cleared = self.lines - lines
+        post_reward = self.grid.reward_metric(lines_cleared)
         reward = post_reward - pre_reward
-        if action in [Action.LEFT, Action.RIGHT, Action.ROTATE]:
-            reward -= 0.0001 * (abs(reward) + 1)
-        # if game_over:
-        #     reward -= 100
+
+        # Action.ROTATE
+        discourage_actions = [Action[act_str] for act_str in self.config.tetris.discouragedActions.actions]
+        encourage_actions = [Action[act_str] for act_str in self.config.tetris.encouragedActions.actions]
+
+        if action in discourage_actions:
+            reward += self.config.tetris.discouragedActions.reward
+        if action in encourage_actions:
+            reward += self.config.tetris.encouragedActions.reward
+
+        if game_over:
+            reward += self.config.tetris.states.gameOver
+
+        self.placement_horizon_counter -= 1
+        if self.config.tetris.truncate.placementTimer.enabled and self.placement_horizon_counter <= 0:
+            truncated = True
+            reward += self.config.tetris.truncate.placementTimer.reward
+            self.placement_horizon_counter = self.config.tetris.truncate.placementTimer.value
+
+        if self.config.tetris.states.cyclic.enabled:
+            if self.back_or_none() == Action.LEFT and action == Action.RIGHT:
+                reward += self.config.tetris.states.cyclic.reward
+            if self.back_or_none() == Action.RIGHT and action == Action.LEFT:
+                reward += self.config.tetris.states.cyclic.reward
+            max_rotates = self.config.tetris.states.cyclic.maxRotates
+            if max_rotates > 0 and all([move == Action.ROTATE for move in self.last_moves[-max_rotates:]]):
+                for move in reversed(self.last_moves[-(3*max_rotates):-max_rotates]):
+                    if move != Action.ROTATE:
+                        break
+                    reward += self.config.tetris.states.cyclic.reward
+
+        if self.config.tetris.states.edges.enabled:
+            if action_result == PerformedAction.HIT_EDGE:
+                reward += self.config.tetris.states.edges.reward
 
         # print(reward)
-        return next_state, float(reward), game_over
+        self.last_moves.append(action)
+        return next_state, float(reward), lines_cleared, game_over, truncated
 
     def empty(self):
         return np.zeros((2, MATRIX_HEIGHT, MATRIX_WIDTH), dtype=np.float32)
@@ -520,6 +587,11 @@ class Matris(object):
             state[0] = grid.grid.astype(np.float32)
             state[1] = grid.blend(self.current_tetromino, matrix=state[1])
         return state
+
+    def current_state(self):
+        if self.is_game_over:
+            raise SystemError("You need to reset the tetris engine before calling current_state! You likely have a bug in your software.")
+        return self.state(self.grid)
 
     def scored(self, lines):
         self.lines += lines
@@ -541,140 +613,11 @@ class Matris(object):
         self.set_tetrominoes()
         self.reset_action_counter()
 
-    def get_best_column_action(self):
-        piece = self.current_tetromino.copy()
-
-        best_action = (0, 0)
-        best_score = -np.inf
-
-        for rotation in range(4):
-            new_piece = piece.copy()
-            new_piece.rotation = rotation
-
-            if self.grid.blend(new_piece) is False:
-                continue
-            piece = new_piece
-
-            while piece.mut_move_left(self.grid):
-                pass
-
-            for i in range(MATRIX_WIDTH):
-                copy = piece.copy()
-                grid = self.grid.copy()
-                while copy.mut_move_down(grid):
-                    pass
-
-                grid.place_tetromino(copy)
-                lines = grid.remove_lines()
-                score = grid.reward_metric(lines)
-
-                if score > best_score:
-                    best_action = (rotation, i)
-                    best_score = score
-
-                piece.mut_move_right(grid)
-
-        return best_action
-
-    def get_columns_state(self):
-        piece = self.current_tetromino.copy()
-
-        states = {
-            0: {},
-            1: {},
-            2: {},
-            3: {}
-        }
-
-        for rotation in range(4):
-            new_piece = piece.copy()
-            new_piece.rotation = rotation
-
-            if self.grid.blend(new_piece) is False:
-                continue
-            piece = new_piece
-
-            while piece.mut_move_left(self.grid):
-                pass
-
-            for i in range(MATRIX_WIDTH):
-                copy = piece.copy()
-                grid = self.grid.copy()
-                while copy.mut_move_down(grid):
-                    pass
-
-                grid.place_tetromino(copy)
-                grid.remove_lines()
-
-                states[rotation][i] = self.state(grid)
-                piece.mut_move_right(grid)
-
-        return states
-
-    def place_in_column(self, rotation, column):
-        cy, cx = self.current_tetromino.position
-
-        diff = cx - column
-
-        score = self.lines
-        for i in range(rotation):
-            self.perform_action(Action.ROTATE, False)
-        try:
-            if diff > 0:
-                for i in range(diff):
-                    self.perform_action(Action.LEFT, False)
-            elif diff < 0:
-                for i in range(-diff):
-                    self.perform_action(Action.RIGHT, False)
-
-            self.perform_action(Action.HARD_DROP, False)
-            game_over = False
-            next_state = self.state(self.grid)
-        except GameOver:
-            game_over = True
-            next_state = self.state(self.grid, True)
-        reward = (self.lines - score) ** 2
-        if game_over:
-            reward = -1000
-
-        return next_state, float(reward), game_over
-
-    def reset_action_counter(self, actions_until_drop=None):
-        if actions_until_drop is not None:
-            self.actions_until_drop = actions_until_drop
-        self.actions_left = self.actions_until_drop
+    def reset_action_counter(self):
+        self.actions_left = self.config.tetris.decay.actionsUntilDrop
 
     def perform_action(self, action, decay=True):
         # print(action)
-
-        match action:
-            case Action.LEFT:
-                self.current_tetromino.mut_move_left(self.grid)
-            case Action.RIGHT:
-                self.current_tetromino.mut_move_right(self.grid)
-            case Action.DOWN:
-                if not self.current_tetromino.mut_move_down(self.grid):
-                    self.place_current()
-                if not self.current_tetromino.try_move_down(self.grid):
-                    self.place_current()
-                    return
-            case Action.HARD_DROP:
-                self.current_tetromino = self.current_tetromino.hard_drop(self.grid)
-                self.place_current()
-            case Action.ROTATE:
-                if not self.current_tetromino.try_move_down(self.grid):
-                    self.place_current()
-                old_piece = self.current_tetromino.copy()
-                new_piece = self.current_tetromino.request_rotation(self.grid)
-                if new_piece is not False:
-                    self.current_tetromino = new_piece
-
-                if not self.current_tetromino.try_move_down(self.grid):
-                    blended = self.grid.blend(self.current_tetromino)
-                    if blended is False:
-                        self.current_tetromino = old_piece
-                    self.place_current()
-                    return
 
         if decay and (action is not Action.DOWN):
             self.actions_left -= 1
@@ -682,6 +625,41 @@ class Matris(object):
                 self.reset_action_counter()
                 if not self.current_tetromino.mut_move_down(self.grid):
                     self.place_current()
+                    return PerformedAction.PLACED
+
+        match action:
+            case Action.LEFT:
+                if not self.current_tetromino.mut_move_left(self.grid):
+                    return PerformedAction.HIT_EDGE
+            case Action.RIGHT:
+                if not self.current_tetromino.mut_move_right(self.grid):
+                    return PerformedAction.HIT_EDGE
+            case Action.DOWN:
+                if not self.current_tetromino.mut_move_down(self.grid):
+                    self.place_current()
+                    return PerformedAction.PLACED
+                if not self.current_tetromino.try_move_down(self.grid):
+                    self.place_current()
+                    return PerformedAction.PLACED
+            case Action.HARD_DROP:
+                self.current_tetromino = self.current_tetromino.hard_drop(self.grid)
+                self.place_current()
+                return PerformedAction.PLACED
+            case Action.ROTATE:
+                if not self.current_tetromino.try_move_down(self.grid):
+                    self.place_current()
+                    return PerformedAction.PLACED
+                new_piece = self.current_tetromino.request_rotation(self.grid)
+                if new_piece:
+                    self.current_tetromino = new_piece
+
+                    if not self.current_tetromino.try_move_down(self.grid):
+                        self.place_current()
+                        return PerformedAction.PLACED
+        if not self.current_tetromino.try_move_down(self.grid):
+            self.place_current()
+            return PerformedAction.PLACED
+        return PerformedAction.NONE
 
     def gameover(self, full_exit=False):
         """
@@ -708,6 +686,10 @@ class Game(object):
 
         self.matris = matris
         self.extra_keys = []
+
+        self.render_font = pygame.font.Font(None, 28)
+        self.render_y = 40
+        self.render_x = WIDTH + 24
         
         screen.blit(construct_nightmare(screen.get_size()), (0,0))
         
@@ -781,7 +763,37 @@ class Game(object):
         except TypeError:
             pass
 
+        self.render_y = 40
+        self.render_x = WIDTH + 24
         pygame.display.flip()
+
+    def draw_model_output(self, logits, action, reward=None):
+        pygame.draw.rect(screen, (15, 15, 20), (WIDTH, 0, 512, HEIGHT))
+
+        labels = ["RIGHT", "LEFT", "DOWN", "ROTATE", "HARD_DROP"]
+        values = logits.detach().cpu().squeeze()
+
+        screen.blit(self.render_font.render("Model output", True, (255, 255, 255)), (self.render_x, self.render_y))
+        self.render_y += 40
+
+        for i, value in enumerate(values):
+            color = (255, 220, 80) if i == action else (220, 220, 220)
+            text = f"{labels[i]}: {float(value):+.4f}"
+            screen.blit(self.render_font.render(text, True, color), (self.render_x, self.render_y))
+            self.render_y += 30
+
+        if reward is not None:
+            self.draw_reward(reward)
+
+        pygame.display.flip()
+
+    def draw_reward(self, reward):
+        self.render_y += 20
+        screen.blit(self.render_font.render(f"Reward: {reward:+.4f}", True, (120, 255, 120)), (self.render_x, self.render_y))
+
+    def draw_sleep(self, sleep):
+        self.render_y += 20
+        screen.blit(self.render_font.render(f"Sleep: {sleep:+.4f}", True, (120, 255, 120)), (self.render_x, self.render_y))
 
     def surface_check(self):
         if self.surface is None:
