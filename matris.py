@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import numpy as np
 import pygame
+from dataclasses import fields
 from pygame import Rect, Surface
 import random
 import os
@@ -164,11 +165,12 @@ class Piece:
         Instantly places tetrominos in the cells below
         """
         piece = self.copy()
+        count = 0
 
         while piece.mut_move_down(grid):
-            pass
+            count += 1
         
-        return piece
+        return piece, count
 
 class Grid:
     def __init__(self, height, width):
@@ -304,11 +306,11 @@ class Grid:
                     holes += 1
         return holes
 
-    def holes(self):
+    def holes(self, heights):
         holes = 0
         for x in range(MATRIX_WIDTH):
             covered_squares = 0
-            for y in reversed(range(0, MATRIX_HEIGHT)):
+            for y in reversed(range(MATRIX_HEIGHT - heights[x], MATRIX_HEIGHT)):
                 # If the square is empty then we can increase the number of covered squares
                 if self.grid[y][x] < COLORED_CELL:
                     covered_squares += 1
@@ -321,10 +323,11 @@ class Grid:
 
     def bumpy(self):
         aggregate_height, heights = self.aggregate_height()
+        holes = self.holes(heights)
         bumps = 0
         for h in range(len(heights) - 1):
             bumps += abs(heights[h] - heights[h+1])
-        return bumps, aggregate_height, heights
+        return bumps, aggregate_height, heights, holes
 
     def row_filled(self):
         # compute the number of fully filled rows
@@ -337,46 +340,18 @@ class Grid:
             total += sub_total / MATRIX_WIDTH
         return total / MATRIX_HEIGHT
 
-    def brett_reward_metric(self, lines):
-        aggregate_height, heights = self.aggregate_height()
-
-        max_height = max(heights)
-        height = MATRIX_HEIGHT - max_height
-
-        total_reward = 0
-
-        filled = 0
-        empty = 0
-        for j in range(height, self.height):
-            row_filled = 0
-            row_empty = 0
-            for i in range(self.width):
-                if self.grid[j][i] >= COLORED_CELL:
-                    row_filled += 1
-                else:
-                    row_empty += 1
-            filled += row_filled
-            empty += row_empty
-
-            # total_reward += (row_filled / (row_empty + row_filled + 1)) ** 2
-
-        # total_reward *= height
-        # total_reward += lines * lines * height
-
-        ratio = filled / (empty + filled + 1)
-
-        # total_reward += ratio ** 2
-
-        return (ratio ** 4) * 100
-
     def paper_reward(self, lines):
-        holes = self.holes()
-        bumps, aggregate_height, heights = self.bumpy()
+        bumps, aggregate_height, heights, holes = self.bumpy()
         return -0.510066 * aggregate_height + 0.760666 * (lines * lines) + -0.35663 * holes + -0.184483 * bumps
 
+    def paper_reward_brett(self, lines):
+        bumps, aggregate_height, heights, holes = self.bumpy()
+        max_height = max(heights)
+        # return -0.510066 * aggregate_height + (0.760666 * 2) * (lines * lines) + -(0.35663 * 2) * holes + -0.184483 * bumps + -0.1 * max_height
+        return -0.510066 * aggregate_height + (0.760666 * 4) * (lines * lines) + -(0.35663 * 3) * holes + -0.184483 * bumps + -0.1 * max_height
+
     def paper_reward2(self, lines):
-        holes = self.holes()
-        bumps, aggregate_height, heights = self.bumpy()
+        bumps, aggregate_height, heights, holes = self.bumpy()
         # from https://gyanigk.github.io/data/DMU_Final_Paper.pdf
         return 25 * (lines * lines) + 10 / (holes + 1) + 5 / (aggregate_height + 1) + 2 / (bumps + 1)
 
@@ -385,11 +360,11 @@ class Grid:
             return -np.inf
         # return self.brett_reward_metric(lines) + self.paper_reward(lines)
         # return self.paper_reward(lines)
-        return self.paper_reward(lines)
+        return self.paper_reward_brett(lines)
 
 
 class Matris(object):
-    def __init__(self, config):
+    def __init__(self, config: DotDict):
         self.grid = Grid(MATRIX_HEIGHT, MATRIX_WIDTH)
         """
         `self.matrix` is the current state of the tetris board, that is, it records which squares are
@@ -414,17 +389,19 @@ class Matris(object):
         self.average_reward = 0
         self.last_moves = []
         self.is_game_over = False
+        self.placed_last = False
 
+    # back of the "last moves" is always the current action, so we need to take the second-to-last action for a true "back"
     def back_or_none(self):
-        return self.last_moves[-1] if len(self.last_moves) > 0 else None
+        return self.last_moves[-2] if len(self.last_moves) > 1 else None
 
-    def best_action_set(self, hard_drop_epsilon = 0.01, decay = True):
+    def best_action_and_position(self, hard_drop_epsilon = 0.01, decay = True) -> tuple[list[Action], int, int]:
         best_actions = None
         best_score = -np.inf
         piece = self.current_tetromino.copy()
         
         if not piece.try_move_down(self.grid):
-            return [Action.DOWN]
+            return [Action.DOWN], piece.position[0] + 1, piece.position[1]
 
         for rotation in range(4):
             # new_piece = piece.request_rotation(self.grid)
@@ -459,7 +436,7 @@ class Matris(object):
                     break
 
         if best_actions is None:
-            return []
+            return [], self.current_tetromino.position[0], self.current_tetromino.position[1]
 
         actions = []
         old_y, old_x = self.current_tetromino.position
@@ -484,7 +461,10 @@ class Matris(object):
             while piece.mut_move_down(self.grid):
                 actions.append(Action.DOWN)
 
-        return actions
+        return actions, new_y, new_x
+
+    def best_action_set(self, hard_drop_epsilon=0.01, decay=True):
+        return self.best_action_and_position(hard_drop_epsilon, decay)[0]
 
     def reset(self):
         self.grid.clear()
@@ -510,6 +490,7 @@ class Matris(object):
         Sets information for the current and next tetrominos
         """
         self.placement_horizon_counter = self.config.tetris.truncate.placementTimer.value
+        self.last_moves = []
 
         self.current_tetromino = self.next_tetromino
         self.next_tetromino = self.select_next()
@@ -527,7 +508,8 @@ class Matris(object):
 
         try:
             action_result = self.perform_action(action, decay=self.config.tetris.decay.enabled)
-            if action_result == PerformedAction.PLACED and self.config.truncate.piecePlacementTruncates:
+            self.placed_last = action_result == PerformedAction.PLACED
+            if self.placed_last and self.config.tetris.truncate.piecePlacementTruncates:
                 truncated = True
             next_state = self.state(self.grid)
         except GameOver:
@@ -535,6 +517,7 @@ class Matris(object):
             game_over = True
             self.is_game_over = True
             next_state = self.state(self.grid, True)
+        self.last_moves.append(action)
 
         lines_cleared = self.lines - lines
         post_reward = self.grid.reward_metric(lines_cleared)
@@ -565,7 +548,7 @@ class Matris(object):
                 reward += self.config.tetris.states.cyclic.reward
             max_rotates = self.config.tetris.states.cyclic.maxRotates
             if max_rotates > 0 and all([move == Action.ROTATE for move in self.last_moves[-max_rotates:]]):
-                for move in reversed(self.last_moves[-(3*max_rotates):-max_rotates]):
+                for move in reversed(self.last_moves[-self.config.tetris.states.cyclic.rotateHorizon:-max_rotates]):
                     if move != Action.ROTATE:
                         break
                     reward += self.config.tetris.states.cyclic.reward
@@ -574,8 +557,18 @@ class Matris(object):
             if action_result == PerformedAction.HIT_EDGE:
                 reward += self.config.tetris.states.edges.reward
 
+        if self.config.tetris.states.earlyMove.enabled:
+            action_map = {Action[(name["name"])]: name["reward"] for name in self.config.tetris.states.earlyMove.actionsReward}
+            if self.current_tetromino.position[0] <= self.config.tetris.states.earlyMove.cutoff:
+                if action in action_map:
+                    factor = self.current_tetromino.position[1]
+                    diminish_factor = pow(self.config.tetris.states.earlyMove.diminishFactor, abs(factor - 3.5))
+                    reward += action_map[action] * diminish_factor
+            elif self.config.tetris.states.earlyMove.punishment.punishLateMoves:
+                if action in action_map:
+                    reward -= action_map[action] * self.config.tetris.states.earlyMove.punishment.factor
+
         # print(reward)
-        self.last_moves.append(action)
         return next_state, float(reward), lines_cleared, game_over, truncated
 
     def empty(self):
@@ -635,6 +628,7 @@ class Matris(object):
                 if not self.current_tetromino.mut_move_right(self.grid):
                     return PerformedAction.HIT_EDGE
             case Action.DOWN:
+                self.score += 1
                 if not self.current_tetromino.mut_move_down(self.grid):
                     self.place_current()
                     return PerformedAction.PLACED
@@ -642,7 +636,8 @@ class Matris(object):
                     self.place_current()
                     return PerformedAction.PLACED
             case Action.HARD_DROP:
-                self.current_tetromino = self.current_tetromino.hard_drop(self.grid)
+                self.current_tetromino, count = self.current_tetromino.hard_drop(self.grid)
+                self.score += count * 2
                 self.place_current()
                 return PerformedAction.PLACED
             case Action.ROTATE:
@@ -696,6 +691,7 @@ class Game(object):
         matris_border = Surface((MATRIX_WIDTH*BLOCKSIZE+BORDERWIDTH*2, VISIBLE_MATRIX_HEIGHT*BLOCKSIZE+BORDERWIDTH*2))
         matris_border.fill(BORDERCOLOR)
         screen.blit(matris_border, (MATRIS_OFFSET,MATRIS_OFFSET))
+        self.extra_text = []
         
         self.redraw()
 
@@ -763,8 +759,32 @@ class Game(object):
         except TypeError:
             pass
 
-        self.render_y = 40
-        self.render_x = WIDTH + 24
+        self.render_y = 225
+        self.render_x = (WIDTH-(MATRIS_OFFSET+BLOCKSIZE*MATRIX_WIDTH+BORDERWIDTH*2)) + 25
+
+        start_pos = (self.render_x - 10, self.render_y - 10)
+        max_width = 0
+
+        def draw_text(text, color=(240, 240, 240)):
+            text = self.render_font.render(text, True, color[:3])
+            return text, text.get_width()
+
+        texts = []
+        for text in self.extra_text:
+            text, width = draw_text(text)
+            max_width = max(width, max_width)
+            texts.append((text, self.render_x, self.render_y))
+            self.render_y += 30
+
+        max_height = self.render_y
+        rect = Rect(start_pos[0], start_pos[1], max_width + 20, max_height - start_pos[1])
+        screen.fill(BORDERCOLOR, Rect(start_pos[0] - BORDERWIDTH, start_pos[1] - BORDERWIDTH,
+                                  max_width + 20 + BORDERWIDTH * 2, max_height - start_pos[1] + BORDERWIDTH * 2))
+        screen.fill(BGCOLOR, rect)
+
+        for (text, x, y) in texts:
+            screen.blit(text, (x, y))
+
         pygame.display.flip()
 
     def draw_model_output(self, logits, action, reward=None):
@@ -892,12 +912,12 @@ class Game(object):
             return surf
         
         #Resizes side panel to allow for all information to be display there.
-        # scoresurf = renderpair("Score", self.matris.score)
+        scoresurf = renderpair("Score", self.matris.score)
         # levelsurf = renderpair("Level", self.matris.level)
         linessurf = renderpair("Lines", self.matris.lines)
         # combosurf = renderpair("Combo", "x{}".format(self.matris.combo))
 
-        height = 20 + linessurf.get_rect().height
+        height = 20 + linessurf.get_rect().height + scoresurf.get_rect().height
         
         #Colours side panel
         area = Surface((width, height))
@@ -906,8 +926,8 @@ class Game(object):
         
         #Draws side panel
         # area.blit(levelsurf, (0,0))
-        # area.blit(scoresurf, (0, levelsurf.get_rect().height))
         area.blit(linessurf, (0, 0))
+        area.blit(scoresurf, (0, linessurf.get_rect().height))
         # area.blit(combosurf, (0, levelsurf.get_rect().height + scoresurf.get_rect().height + linessurf.get_rect().height))
 
         screen.blit(area, area.get_rect(bottom=HEIGHT-MATRIS_OFFSET, centerx=TRICKY_CENTERX))
