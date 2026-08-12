@@ -7,7 +7,7 @@ import random
 import os
 import MaTris.kezmenu.kezmenu as kezmenu
 
-from MaTris.tetrominoes import list_of_tetrominoes
+from MaTris.tetrominoes import list_of_tetrominoes, tetrominoes
 from MaTris.tetrominoes import rotate
 
 from MaTris.scores import load_score, write_score
@@ -15,6 +15,7 @@ from enum import Enum
 
 from MaTris.tetrominoes import tetrominoes_index
 from config import DotDict
+import tetris
 
 
 class GameOver(Exception):
@@ -669,7 +670,7 @@ class Matris(object):
             raise GameOver("Sucker!")
 
 class Game(object):
-    def main(self, sc, matris):
+    def main(self, sc, matris: tetris.PyTetrisEngine):
         """
         Main loop for game
         Redraws scores and next tetromino each time the loop is passed through
@@ -679,7 +680,7 @@ class Game(object):
         global screen
         screen = sc
 
-        self.matris = matris
+        self.matris: tetris.PyTetrisEngine = matris
         self.extra_keys = []
 
         self.render_font = pygame.font.Font(None, 28)
@@ -703,17 +704,17 @@ class Game(object):
         user_actions = []
         for event in keyups:
             if event.key == pygame.K_SPACE:
-                user_actions.append(Action.HARD_DROP)
+                user_actions.append(Action.HARD_DROP.value)
             elif event.key == pygame.K_UP or event.key == pygame.K_w:
-                user_actions.append(Action.ROTATE)
+                user_actions.append(Action.ROTATE.value)
             elif event.key == pygame.K_LEFT or event.key == pygame.K_a:
-                user_actions.append(Action.LEFT)
+                user_actions.append(Action.LEFT.value)
             elif event.key == pygame.K_RIGHT or event.key == pygame.K_d:
-                user_actions.append(Action.RIGHT)
+                user_actions.append(Action.RIGHT.value)
             elif event.key == pygame.K_DOWN or event.key == pygame.K_s:
-                user_actions.append(Action.DOWN)
+                user_actions.append(Action.DOWN.value)
             elif event.key == pygame.K_ESCAPE:
-                self.matris.gameover()
+                raise SystemExit("Game Over")
             else:
                 self.extra_keys.append(event.key)
         return user_actions
@@ -733,16 +734,12 @@ class Game(object):
             # Controls pausing and quitting the game.
             for event in events:
                 if event.type == pygame.QUIT:
-                    self.matris.gameover(full_exit=True)
+                    raise SystemExit("Game Over")
 
     def draw(self, framerate = 50):
         self.clock.tick(framerate)
         self.update()
         self.redraw()
-
-    def step(self, timepassed):
-        if self.matris.update(timepassed):
-            self.redraw()
 
     def redraw(self):
         try:
@@ -750,8 +747,8 @@ class Game(object):
             Redraws the information panel and next termoino panel
             """
             surface_of_next_tetromino = self.construct_surface_of_next_tetromino()
-            tetromino_block = self.block(self.matris.current_tetromino.color)
-            shadow_block = self.block(self.matris.current_tetromino.color, shadow=True)
+            tetromino_block = self.block("blue")
+            shadow_block = self.block("blue", shadow=True)
             self.blit_next_tetromino(surface_of_next_tetromino)
             self.blit_info()
 
@@ -825,27 +822,26 @@ class Game(object):
         """
         Draws the image of the current tetromino
         """
-        # matrix=self.place_shadow()
-        # matrix=self.grid.place_shadow(self.current_tetromino)
+        with_tetromino = self.matris.current_state()
+        with_tetromino = with_tetromino[0] + with_tetromino[1]
+        # print(with_tetromino)
 
-        with_tetromino = self.matris.grid.blend(self.matris.current_tetromino, matrix=self.matris.grid.place_shadow(self.matris.current_tetromino))
-
-        if with_tetromino is False:
-            with_tetromino = self.matris.grid.grid
+        fall_location = self.matris.preview_fall_location() * 2
+        with_tetromino += fall_location[0]
 
         for y in range(MATRIX_HEIGHT):
             for x in range(MATRIX_WIDTH):
 
                 #                                       I hide the 2 first rows by drawing them outside of the surface
                 block_location = Rect(x * BLOCKSIZE, (y * BLOCKSIZE - 2 * BLOCKSIZE), BLOCKSIZE, BLOCKSIZE)
-                if with_tetromino[y][x] == EMPTY_CELL:
+                if with_tetromino[y][x] == 0:
                     self.surface.fill(BGCOLOR, block_location)
                 else:
-                    if with_tetromino[y][x] == SHADOW_CELL:
+                    if with_tetromino[y][x] == 1:
+                        self.surface.blit(tetromino_block, block_location)
+                    else:
                         self.surface.fill(BGCOLOR, block_location)
                         self.surface.blit(shadow_block, block_location)
-                    else:
-                        self.surface.blit(tetromino_block, block_location)
 
     def block(self, color, shadow=False):
         """
@@ -884,13 +880,22 @@ class Game(object):
         """
         Draws the image of the next tetromino
         """
-        shape = self.matris.next_tetromino.shape
+        mapping = {
+            'I': tetrominoes["long"],
+            'O': tetrominoes["square"],
+            'T': tetrominoes["hat"],
+            'J': tetrominoes["left_gun"],
+            'L': tetrominoes["right_gun"],
+            'S': tetrominoes["right_snake"],
+            'Z': tetrominoes["left_snake"],
+        }
+        shape = mapping[self.matris.next_piece()].shape
         surf = Surface((len(shape)*BLOCKSIZE, len(shape)*BLOCKSIZE), pygame.SRCALPHA, 32)
 
         for y in range(len(shape)):
             for x in range(len(shape)):
                 if shape[y][x]:
-                    surf.blit(self.block(self.matris.next_tetromino.color), (x*BLOCKSIZE, y*BLOCKSIZE))
+                    surf.blit(self.block("blue"), (x*BLOCKSIZE, y*BLOCKSIZE))
         return surf
 
     def blit_info(self):
@@ -912,9 +917,9 @@ class Game(object):
             return surf
         
         #Resizes side panel to allow for all information to be display there.
-        scoresurf = renderpair("Score", self.matris.score)
+        scoresurf = renderpair("Score", self.matris.score())
         # levelsurf = renderpair("Level", self.matris.level)
-        linessurf = renderpair("Lines", self.matris.lines)
+        linessurf = renderpair("Lines", self.matris.lines())
         # combosurf = renderpair("Combo", "x{}".format(self.matris.combo))
 
         height = 20 + linessurf.get_rect().height + scoresurf.get_rect().height
@@ -950,55 +955,6 @@ class Game(object):
 
         screen.blit(area, area.get_rect(top=MATRIS_OFFSET, centerx=TRICKY_CENTERX))
 
-class Menu(object):
-    """
-    Creates main menu
-    """
-    running = True
-    def main(self, screen):
-        clock = pygame.time.Clock()
-        menu = kezmenu.KezMenu(
-            ['Play!', lambda: Game().main(screen)],
-            ['Quit', lambda: setattr(self, 'running', False)],
-        )
-        menu.position = (50, 50)
-        menu.enableEffect('enlarge-font-on-focus', font=None, size=60, enlarge_factor=1.2, enlarge_time=0.3)
-        menu.color = (255,255,255)
-        menu.focus_color = (40, 200, 40)
-        
-        nightmare = construct_nightmare(screen.get_size())
-        highscoresurf = self.construct_highscoresurf() #Loads highscore onto menu
-
-        timepassed = clock.tick(30) / 1000.
-
-        while self.running:
-            events = pygame.event.get()
-
-            for event in events:
-                if event.type == pygame.QUIT:
-                    exit()
-
-            menu.update(events, timepassed)
-
-            timepassed = clock.tick(30) / 1000.
-
-            if timepassed > 1: # A game has most likely been played 
-                highscoresurf = self.construct_highscoresurf()
-
-            screen.blit(nightmare, (0,0))
-            screen.blit(highscoresurf, highscoresurf.get_rect(right=WIDTH-50, bottom=HEIGHT-50))
-            menu.draw(screen)
-            pygame.display.flip()
-
-    def construct_highscoresurf(self):
-        """
-        Loads high score from file
-        """
-        font = pygame.font.Font(None, 50)
-        highscore = load_score()
-        text = "Highscore: {}".format(highscore)
-        return font.render(text, True, (255,255,255))
-
 def construct_nightmare(size):
     """
     Constructs background image
@@ -1021,10 +977,3 @@ def construct_nightmare(size):
     del arr
     return surf
 
-
-if __name__ == '__main__':
-    pygame.init()
-
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("MaTris")
-    Menu().main(screen)
